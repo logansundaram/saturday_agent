@@ -13,7 +13,7 @@ export default function Monitor(){
                 <span className="text-right" onClick={() => {
                     setOpen(!open);
                 }}>
-                    {open ? <>+</> : <>-</>}
+                    {open ? <>-</> : <>+</>}
                 </span> 
             </div>
 
