@@ -1,5 +1,8 @@
 import Card from "../components/card"
 import ChatPage from "../components/chat_page"
+import ModelPage from "../components/model_page"
+import ToolPage from "../components/tool_page"
+import WorkflowPage from "../components/workflow_page"
 import Monitor from "../components/monitor"
 import LeftNav from "../components/left_nav"
 import { useState } from "react"
@@ -14,11 +17,11 @@ export default function Dashboard(){
             {page === "chat" ? (
                 <ChatPage/>
             ) : page === "models" ? (
-                <Card header="model" body="this is a test card"/>
+                <ModelPage/>
             ) : page === "tools" ? (
-                <Card header="tools" body="this is a test card"/>
+                <ToolPage/>
             ) : page === "workflows" ? (
-                <Card header="workflows" body="this is a test card"/>
+                <WorkflowPage/>
             ) : null}
             <Monitor/>
         </div>

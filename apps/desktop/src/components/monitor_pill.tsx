@@ -1,23 +1,31 @@
-interface Monitor_PillProps{
-    header : string;
-    name : string;
-    useage: string;
+type Monitor_PillProps = {
+  header: string
+  name: string
+  usage: number
 }
 
+export default function Monitor_Pill({ header, name, usage }: Monitor_PillProps) {
+  const barColor =
+    usage >= 100
+      ? "bg-red-600"
+      : usage >= 90
+      ? "bg-orange-500"
+      : usage < 80
+      ? "bg-green-500"
+      : "bg-yellow-400"
 
-//cut useage line and instead use the bar to convey useage info, red maxed out, orange over 90 percent, green under 80 percent
-export default function Monitor_Pill({header, name, useage} : Monitor_PillProps){
-    return (
-        <div className="border-1 m-2 p-4 grid grid-rows-3 gap-2 rounded-lg text-left">
-            <div className="">
-                {header} : {name}
-            </div>
-            <div>
-                Useage : {useage}%
-            </div>
-            <div className="mt-2 h-2 w-full rounded bg-slate-200">
-                <span className="block h-full rounded bg-green-500"/>
-            </div>
-        </div>
-    )
+  return (
+    <div className="m-2 p-4 grid gap-3 rounded-lg border text-left">
+      <div className="text-sm font-medium text-slate-700">
+        {header} · {name}
+      </div>
+
+      <div className="h-2 w-full rounded bg-slate-200 overflow-hidden">
+        <span
+          className={`block h-full transition-all ${barColor}`}
+          style={{ width: `${Math.min(usage, 100)}%` }}
+        />
+      </div>
+    </div>
+  )
 }

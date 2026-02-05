@@ -1,42 +1,50 @@
-#root {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
+:root {
+  --bg-root: #020617;
+  --bg-panel: #111827;
+  --bg-surface: #e5e7eb;
+
+  --text-primary: #f9fafb;
+  --text-secondary: #6b7280;
+
+  --accent-primary: #064e3b;
+
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
-}
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
-}
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafbaa);
+:root{
+  color: var(--text-primary);
 }
 
-@keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+/* Backgrounds */
+.bg-root {
+  background-color: var(--bg-root);
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  a:nth-of-type(2) .logo {
-    animation: logo-spin infinite 20s linear;
-  }
+.bg-panel {
+  background-color: var(--bg-panel);
 }
 
-.card {
-  padding: 2em;
+.bg-surface {
+  background-color: var(--bg-surface);
 }
 
-.read-the-docs {
-  color: #888;
+/* Text */
+.text-primary {
+  color: var(--text-primary);
+}
+
+.text-secondary {
+  color: var(--text-secondary);
+}
+
+/* Actions / States */
+.accent {
+  color: var(--accent-primary);
+}
+
+.bg-accent {
+  background-color: var(--accent-primary);
+}
+
+.border-accent {
+  border-color: var(--accent-primary);
 }
