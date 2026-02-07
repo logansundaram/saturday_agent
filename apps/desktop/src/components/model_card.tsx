@@ -9,37 +9,57 @@ type ModelCardProps = {
 }
 
 
-export default function ModelCard(){
-    return(
-        <div className="rounded-lg border-1 w-60 h-80">
-            <div className="text-xl p-4 text-left">
-                <div>
-                    LLM Title
-                </div>  
-                <div className="text-sm">
-                    LLM Provider/Company
-                </div>
-            </div>
-
-            <div className="text-left p-2">
-                Model Size: 28GB 
-            </div>
-
-            <div className="text-left p-2">
-                Strengths: Reasoning, Coding, Agentic
-            </div>
-
-            <div className="text-left p-2">
-                Source: local
-            </div>
-
-            <div className="text-left p-2">
-                Rating: Excellent
-                <div className="text-sm">
-                    This model will run effectively on your machine
-                </div>
-            </div>
-
+export default function ModelCard() {
+  return (
+    <div className="w-80 h-96 rounded-xl border bg-panel p-6 flex flex-col">
+      <div className="space-y-1">
+        <div className="text-base font-semibold tracking-tight leading-tight">
+          Qwen 2.5 32B
         </div>
-    )
+        <div className="text-sm text-muted-foreground leading-tight">
+          Alibaba
+        </div>
+      </div>
+
+      <div className="mt-6 space-y-5 text-sm">
+        <div className="space-y-1">
+          <div className="text-muted-foreground">
+            Model Size
+          </div>
+          <div className="font-medium">
+            28 GB
+          </div>
+        </div>
+
+        <div className="space-y-1">
+          <div className="text-muted-foreground">
+            Strengths
+          </div>
+          <div className="font-medium">
+            Reasoning, Coding, Agentic
+          </div>
+        </div>
+
+        <div className="space-y-1">
+          <div className="text-muted-foreground">
+            Source
+          </div>
+          <div className="font-medium">
+            Local
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-auto pt-5 border-t text-sm space-y-1">
+        <div className="font-semibold text-green-500">
+          Excellent
+        </div>
+        <div className="text-muted-foreground">
+          Runs efficiently on your machine
+        </div>
+      </div>
+    </div>
+  )
 }
+
+

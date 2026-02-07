@@ -19,3 +19,29 @@
 @media (prefers-color-scheme: light) {
 
 }
+
+@layer components{
+  .section-header{
+    @apply text-left text-9xl
+  }
+
+  .section-framer {
+    @apply text-xl
+  }
+
+  .section-hero {
+    @apply p-4
+  }
+
+  .header {
+    @apply text-2xl
+  }
+
+  .framer {
+    @apply text-xl
+  }
+
+  .section-base{
+    @apply px-50 h-screen
+  }
+}

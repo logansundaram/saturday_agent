@@ -1,21 +1,21 @@
-import ModelCard from "./model_card";
+import WorkflowCard from "./workflow_card"
+
 
 export default function WorkflowPage(){
     return (
-        <div className="bg-panel px-50 h-screen">
-            <h1 className="text-left p-4 text-9xl">
-                Models
-            </h1>
-
-            <div className="text-left p-4">
-
-                <div className="grid grid-cols-3 w-full place-items-center">
-                    <ModelCard/>
-                    <ModelCard/>
-                    <ModelCard/>
-                </div>
-
+        <div className="bg-panel section-base">
+            <div className="section-hero">
+                <h1 className="section-header">
+                    Workflows
+                </h1>
+                <p className="section-framer">
+                    Local, transparent workflows by default. Inspect, replay, and tailor each step to fit your task.
+                </p>
             </div>
+
+
+            <WorkflowCard/>
+
 
         </div>
     )

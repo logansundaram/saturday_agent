@@ -2,10 +2,16 @@ import ModelCard from "./model_card";
 
 export default function ModelPage(){
     return (
-        <div className="bg-panel px-50 h-screen">
-            <h1 className="text-left p-4 text-9xl">
-                Models
-            </h1>
+        <div className="bg-panel section-base">
+            <div className="section-hero">
+                <h1 className="section-header">
+                    Models
+                </h1>
+                <p className="section-framer">
+                    Local-first models by default, with optional cloud APIs. Choose the right model for each task, on your terms.
+                </p>
+            </div>
+
 
             <div className="text-left p-4">
 
