@@ -13,7 +13,19 @@ export default function ToolPage(){
                 </p>
             </div>
 
-            <ToolCard/>
+            <div className="p-4 header">
+                <h1 className="te">
+                    Existing Tools 
+                </h1>
+                <div className="grid grid-cols-3 gap-4">
+                    <ToolCard/>
+
+                    <ToolCard/>
+
+                    <ToolCard/>
+                </div>
+            </div>
+
 
         </div>
     )

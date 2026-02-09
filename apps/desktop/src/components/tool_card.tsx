@@ -1,3 +1,5 @@
+import Header from "./header"
+
 export default function ToolCard() {
   return (
     <div className="w-60 h-40 rounded-xl border bg-panel p-4 flex flex-col">

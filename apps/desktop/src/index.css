@@ -44,4 +44,8 @@
   .section-base{
     @apply px-50 h-screen
   }
+
+  .button {
+    @apply hover:bg-slate-400 rounded-lg p-2
+  }
 }
