@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saturday-agent"
+version = "0.1.0"
+description = "Modular LangGraph workflows for Saturday Agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "langgraph",
+  "httpx",
+  "pydantic>=2,<3",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

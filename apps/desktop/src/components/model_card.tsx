@@ -11,7 +11,7 @@ type ModelCardProps = {
 
 export default function ModelCard() {
   return (
-    <div className="w-80 h-96 rounded-xl border bg-panel p-6 flex flex-col">
+    <div className="w-80 h-96 rounded-xl border border-subtle bg-panel p-6 flex flex-col">
       <div className="space-y-1">
         <div className="text-base font-semibold tracking-tight leading-tight">
           Qwen 2.5 32B
@@ -50,8 +50,8 @@ export default function ModelCard() {
         </div>
       </div>
 
-      <div className="mt-auto pt-5 border-t text-sm space-y-1">
-        <div className="font-semibold text-green-500">
+      <div className="mt-auto pt-5 border-t border-subtle text-sm space-y-1">
+        <div className="font-semibold text-gold">
           Excellent
         </div>
         <div className="text-muted-foreground">
@@ -61,5 +61,4 @@ export default function ModelCard() {
     </div>
   )
 }
-
 

@@ -1,32 +1,5 @@
-import ToolCard from "./tool_card"
+import ToolsPage from "../pages/ToolsPage";
 
-
-export default function ToolPage(){
-    return (
-        <div className="bg-panel section-base">
-            <div className="section-hero">
-                <h1 className="section-header">
-                    Tools
-                </h1>
-                <p className="section-framer">
-                    Local tools by default, with optional external integrations. Compose, inspect, and control every action your agent takes.
-                </p>
-            </div>
-
-            <div className="p-4 header">
-                <h1 className="te">
-                    Existing Tools 
-                </h1>
-                <div className="grid grid-cols-3 gap-4">
-                    <ToolCard/>
-
-                    <ToolCard/>
-
-                    <ToolCard/>
-                </div>
-            </div>
-
-
-        </div>
-    )
+export default function ToolPage() {
+  return <ToolsPage />;
 }

@@ -1,16 +1,22 @@
 :root {
-  --bg-root: #020617;
-  --bg-panel: #111827;
-  --bg-surface: #e5e7eb;
+  --bg-root: #050505;
+  --bg-panel: #0f0f12;
+  --bg-surface: #f8f6f0;
 
-  --text-primary: #f9fafb;
-  --text-secondary: #6b7280;
+  --text-primary: #f7f7f7;
+  --text-secondary: #b7b7b7;
 
-  --accent-primary: #064e3b;
-
+  --accent-primary: #6d28d9;
+  --accent-gold: #d4af37;
+  --border-subtle: #1b1b1f;
 }
 
 :root{
+  color: var(--text-primary);
+}
+
+body {
+  background-color: var(--bg-root);
   color: var(--text-primary);
 }
 
@@ -36,6 +42,18 @@
   color: var(--text-secondary);
 }
 
+.text-foreground {
+  color: var(--text-primary);
+}
+
+.text-muted-foreground {
+  color: var(--text-secondary);
+}
+
+.text-gold {
+  color: var(--accent-gold);
+}
+
 /* Actions / States */
 .accent {
   color: var(--accent-primary);
@@ -47,4 +65,16 @@
 
 .border-accent {
   border-color: var(--accent-primary);
+}
+
+.bg-gold {
+  background-color: var(--accent-gold);
+}
+
+.border-gold {
+  border-color: var(--accent-gold);
+}
+
+.border-subtle {
+  border-color: var(--border-subtle);
 }

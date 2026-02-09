@@ -20,3 +20,12 @@ electron.contextBridge.exposeInMainWorld("ipcRenderer", {
   // You can expose other APTs you need here.
   // ...
 });
+electron.contextBridge.exposeInMainWorld("system", {
+  subscribe(callback) {
+    const listener = (_event, payload) => {
+      callback(payload);
+    };
+    electron.ipcRenderer.on("system:metrics", listener);
+    return () => electron.ipcRenderer.off("system:metrics", listener);
+  }
+});

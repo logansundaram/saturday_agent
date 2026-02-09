@@ -22,3 +22,13 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
   // You can expose other APTs you need here.
   // ...
 })
+
+contextBridge.exposeInMainWorld('system', {
+  subscribe(callback: (payload: unknown) => void) {
+    const listener = (_event: unknown, payload: unknown) => {
+      callback(payload)
+    }
+    ipcRenderer.on('system:metrics', listener)
+    return () => ipcRenderer.off('system:metrics', listener)
+  },
+})

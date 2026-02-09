@@ -1,6 +1,6 @@
 import Card from "../components/card"
-import ChatPage from "../components/chat_page"
-import ModelPage from "../components/model_page"
+import ChatPage from "./ChatPage"
+import ModelsPage from "./ModelsPage"
 import ToolPage from "../components/tool_page"
 import WorkflowPage from "../components/workflow_page"
 import Monitor from "../components/monitor"
@@ -17,7 +17,7 @@ export default function Dashboard(){
             {page === "chat" ? (
                 <ChatPage/>
             ) : page === "models" ? (
-                <ModelPage/>
+                <ModelsPage/>
             ) : page === "tools" ? (
                 <ToolPage/>
             ) : page === "workflows" ? (

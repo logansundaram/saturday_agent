@@ -1,0 +1,7 @@
+-e ../agent
+fastapi
+uvicorn
+httpx
+pydantic
+python-dotenv
+langgraph

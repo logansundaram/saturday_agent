@@ -7,7 +7,7 @@ interface CardProps{
 export default function Card({header, body} : CardProps){
     return (
         <div>
-            <h1 className="text-blue-900">
+            <h1 className="accent">
                 {header}
             </h1>
             <p>

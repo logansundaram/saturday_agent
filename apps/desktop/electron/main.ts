@@ -2,6 +2,7 @@ import { app, BrowserWindow } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+import { startMetricsPolling, stopMetricsPolling } from './ipc/systemMetrics'
 
 const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -29,6 +30,8 @@ let win: BrowserWindow | null
 function createWindow() {
   win = new BrowserWindow({
     icon: path.join(process.env.VITE_PUBLIC, 'electron-vite.svg'),
+    titleBarStyle: 'hidden',
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
     },
@@ -45,6 +48,8 @@ function createWindow() {
     // win.loadFile('dist/index.html')
     win.loadFile(path.join(RENDERER_DIST, 'index.html'))
   }
+
+  startMetricsPolling()
 }
 
 // Quit when all windows are closed, except on macOS. There, it's common
@@ -55,6 +60,7 @@ app.on('window-all-closed', () => {
     app.quit()
     win = null
   }
+  stopMetricsPolling()
 })
 
 app.on('activate', () => {
@@ -63,6 +69,10 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow()
   }
+})
+
+app.on('before-quit', () => {
+  stopMetricsPolling()
 })
 
 app.whenReady().then(createWindow)

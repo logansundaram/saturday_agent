@@ -46,6 +46,6 @@
   }
 
   .button {
-    @apply hover:bg-slate-400 rounded-lg p-2
+    @apply hover:bg-purple-500/10 rounded-lg p-2
   }
 }

@@ -1,6 +1,6 @@
 export default function WorkflowCard() {
   return (
-    <div className="w-60 h-44 rounded-xl border bg-panel px-4 pt-4 pb-3 flex flex-col">
+    <div className="w-60 h-44 rounded-xl border border-subtle bg-panel px-4 pt-4 pb-3 flex flex-col">
       <div className="space-y-0.5">
         <div className="text-sm font-medium tracking-tight leading-tight">
           Document Q&A
@@ -20,11 +20,11 @@ export default function WorkflowCard() {
         Deterministic
       </div>
 
-      <div className="mt-auto pt-3 border-t flex justify-between items-end text-xs">
+      <div className="mt-auto pt-3 border-t border-subtle flex justify-between items-end text-xs">
         <span className="text-muted-foreground leading-none">
           Status
         </span>
-        <span className="font-medium text-green-500 leading-none">
+        <span className="font-medium text-gold leading-none">
           Ready
         </span>
       </div>
