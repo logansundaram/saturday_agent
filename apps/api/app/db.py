@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -65,6 +67,36 @@ def init_db(db_path: str) -> None:
                 size INTEGER,
                 sha256 TEXT,
                 created_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tools (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                kind TEXT,
+                type TEXT,
+                description TEXT,
+                enabled INTEGER,
+                config_json TEXT,
+                input_schema_json TEXT,
+                output_schema_json TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                description TEXT,
+                enabled INTEGER,
+                graph_json TEXT,
+                created_at TEXT,
+                updated_at TEXT
             )
             """
         )
@@ -216,6 +248,219 @@ def read_artifact(artifact_id: str) -> Optional[dict]:
         if row is None:
             return None
         return dict(row)
+
+
+def upsert_tool(tool: dict) -> None:
+    tool_id = str(tool.get("id") or "").strip()
+    if not tool_id:
+        raise ValueError("Tool id is required.")
+
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO tools (
+                id, name, kind, type, description, enabled,
+                config_json, input_schema_json, output_schema_json,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                kind = excluded.kind,
+                type = excluded.type,
+                description = excluded.description,
+                enabled = excluded.enabled,
+                config_json = excluded.config_json,
+                input_schema_json = excluded.input_schema_json,
+                output_schema_json = excluded.output_schema_json,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                tool_id,
+                str(tool.get("name") or tool_id),
+                str(tool.get("kind") or "external"),
+                str(tool.get("type") or "http"),
+                str(tool.get("description") or ""),
+                1 if bool(tool.get("enabled", True)) else 0,
+                _json_dumps(tool.get("config") if isinstance(tool.get("config"), dict) else {}),
+                _json_dumps(tool.get("input_schema")),
+                _json_dumps(tool.get("output_schema")),
+                str(tool.get("created_at") or ""),
+                str(tool.get("updated_at") or ""),
+            ),
+        )
+        conn.commit()
+
+
+def list_tools() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, kind, type, description, enabled,
+                   config_json, input_schema_json, output_schema_json,
+                   created_at, updated_at
+            FROM tools
+            ORDER BY name COLLATE NOCASE ASC, id ASC
+            """
+        ).fetchall()
+        return [_tool_row_to_definition(row) for row in rows]
+
+
+def get_tool(tool_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, name, kind, type, description, enabled,
+                   config_json, input_schema_json, output_schema_json,
+                   created_at, updated_at
+            FROM tools
+            WHERE id = ?
+            """,
+            (tool_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _tool_row_to_definition(row)
+
+
+def set_tool_enabled(tool_id: str, enabled: bool) -> bool:
+    updated_at = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        result = conn.execute(
+            """
+            UPDATE tools
+            SET enabled = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (1 if enabled else 0, updated_at, tool_id),
+        )
+        conn.commit()
+        return result.rowcount > 0
+
+
+def upsert_workflow(workflow: dict) -> None:
+    workflow_id = str(workflow.get("id") or "").strip()
+    if not workflow_id:
+        raise ValueError("Workflow id is required.")
+
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO workflows (
+                id, name, description, enabled, graph_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                enabled = excluded.enabled,
+                graph_json = excluded.graph_json,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                workflow_id,
+                str(workflow.get("name") or workflow_id),
+                str(workflow.get("description") or ""),
+                1 if bool(workflow.get("enabled", True)) else 0,
+                _json_dumps(workflow.get("graph") if isinstance(workflow.get("graph"), dict) else {}),
+                str(workflow.get("created_at") or ""),
+                str(workflow.get("updated_at") or ""),
+            ),
+        )
+        conn.commit()
+
+
+def list_workflows() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, description, enabled, graph_json, created_at, updated_at
+            FROM workflows
+            ORDER BY name COLLATE NOCASE ASC, id ASC
+            """
+        ).fetchall()
+        return [_workflow_row_to_definition(row) for row in rows]
+
+
+def get_workflow(workflow_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, name, description, enabled, graph_json, created_at, updated_at
+            FROM workflows
+            WHERE id = ?
+            """,
+            (workflow_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _workflow_row_to_definition(row)
+
+
+def set_workflow_enabled(workflow_id: str, enabled: bool) -> bool:
+    updated_at = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        result = conn.execute(
+            """
+            UPDATE workflows
+            SET enabled = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (1 if enabled else 0, updated_at, workflow_id),
+        )
+        conn.commit()
+        return result.rowcount > 0
+
+
+def _tool_row_to_definition(row: sqlite3.Row) -> dict:
+    input_schema = _json_loads(row["input_schema_json"])
+    output_schema = _json_loads(row["output_schema_json"])
+    return {
+        "id": str(row["id"]),
+        "name": str(row["name"] or row["id"]),
+        "kind": str(row["kind"] or "external"),
+        "type": str(row["type"] or "http"),
+        "description": str(row["description"] or ""),
+        "enabled": bool(int(row["enabled"] or 0)),
+        "config": _json_loads(row["config_json"]) or {},
+        "input_schema": input_schema if isinstance(input_schema, (dict, list)) else None,
+        "output_schema": output_schema if isinstance(output_schema, (dict, list)) else None,
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
+def _workflow_row_to_definition(row: sqlite3.Row) -> dict:
+    graph = _json_loads(row["graph_json"])
+    return {
+        "id": str(row["id"]),
+        "name": str(row["name"] or row["id"]),
+        "title": str(row["name"] or row["id"]),
+        "description": str(row["description"] or ""),
+        "enabled": bool(int(row["enabled"] or 0)),
+        "source": "custom",
+        "type": "custom",
+        "graph": graph if isinstance(graph, dict) else {"nodes": [], "edges": []},
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
+def _json_loads(raw: Optional[str]) -> object:
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _json_dumps(value: object) -> str:
+    return json.dumps(value, default=str)
 
 
 def _connect() -> sqlite3.Connection:

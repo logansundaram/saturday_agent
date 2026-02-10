@@ -4,14 +4,16 @@ import copy
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app import artifacts, db, graph
 
@@ -22,7 +24,6 @@ try:
     _API_DIR = _MAIN_FILE.parents[1]
     _REPO_ROOT = _MAIN_FILE.parents[3]
 
-    # Load non-committed local env first, then standard .env files.
     for _dotenv_path in (
         _REPO_ROOT / ".local.env",
         _API_DIR / ".local.env",
@@ -35,6 +36,8 @@ except Exception:
     pass
 
 WorkflowType = Literal["simple", "moderate", "complex"]
+ToolType = Literal["http", "python", "prompt"]
+ToolKind = Literal["local", "external"]
 
 
 class ChatRunRequest(BaseModel):
@@ -74,10 +77,13 @@ class HealthResponse(BaseModel):
 class WorkflowSummary(BaseModel):
     id: str
     title: str
+    name: Optional[str] = None
     description: str
     type: str
     version: str
     status: str
+    source: str = "builtin"
+    enabled: bool = True
 
 
 class WorkflowsResponse(BaseModel):
@@ -102,6 +108,161 @@ class ArtifactUploadResponse(BaseModel):
     mime: str
     size: int
     sha256: str
+
+
+class ToolSummary(BaseModel):
+    id: str
+    name: str
+    kind: str = "external"
+    type: str = "http"
+    description: str
+    enabled: bool
+    source: str = "builtin"
+    config: Dict[str, Any] = Field(default_factory=dict)
+    input_schema: Any = None
+    output_schema: Any = None
+    created_at: str
+    updated_at: str
+
+
+class ToolsResponse(BaseModel):
+    tools: List[ToolSummary]
+
+
+class CreateToolRequest(BaseModel):
+    name: str
+    id: Optional[str] = None
+    kind: ToolKind = "external"
+    description: str = ""
+    type: ToolType
+    config: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    input_schema: Any = None
+    output_schema: Any = None
+
+
+class UpdateToolRequest(BaseModel):
+    enabled: bool
+
+
+class WorkflowNodeSchema(BaseModel):
+    id: str
+    type: Literal["start", "llm", "tool", "condition", "end"]
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowEdgeSchema(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_node: str = Field(alias="from")
+    to: str
+    condition: Literal["always", "true", "false"] = "always"
+
+
+class WorkflowGraphSchema(BaseModel):
+    nodes: List[WorkflowNodeSchema] = Field(default_factory=list)
+    edges: List[WorkflowEdgeSchema] = Field(default_factory=list)
+
+
+class WorkflowDefinitionResponse(BaseModel):
+    id: str
+    name: str
+    title: Optional[str] = None
+    description: str
+    enabled: bool
+    source: str = "custom"
+    type: str = "custom"
+    graph: Dict[str, Any] = Field(default_factory=lambda: {"nodes": [], "edges": []})
+    created_at: str
+    updated_at: str
+
+
+class CreateWorkflowRequest(BaseModel):
+    id: Optional[str] = None
+    name: str
+    description: str = ""
+    enabled: bool = True
+    graph: WorkflowGraphSchema
+
+
+class UpdateWorkflowRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    enabled: Optional[bool] = None
+    graph: Optional[WorkflowGraphSchema] = None
+
+
+class WorkflowCompileRequest(BaseModel):
+    task: str
+    context: Optional[Dict[str, Any]] = None
+    workflow_type: Optional[WorkflowType] = None
+
+
+class WorkflowCompileResponse(BaseModel):
+    workflow_id: str
+    workflow_type: str
+    graph: Dict[str, Any]
+
+
+class WorkflowRunRequest(BaseModel):
+    workflow_id: str
+    input: Dict[str, Any]
+
+
+class WorkflowRunResponse(BaseModel):
+    run_id: str
+    workflow_id: str
+    workflow_type: str
+    status: str
+    output: Dict[str, Any]
+    steps: List[Dict[str, Any]]
+
+
+class RunStepError(BaseModel):
+    message: str
+    stack: Optional[str] = None
+
+
+class RunLogStep(BaseModel):
+    step_index: int
+    name: str
+    status: Literal["ok", "error"]
+    started_at: str
+    ended_at: str
+    input: Any = None
+    output: Any = None
+    error: Optional[RunStepError] = None
+
+
+class RunLogsResponse(BaseModel):
+    run_id: str
+    steps: List[RunLogStep]
+
+
+class RunDetailResponse(BaseModel):
+    run_id: str
+    kind: Literal["chat", "workflow"]
+    status: str
+    workflow_id: str
+    workflow_type: Optional[str] = None
+    model_id: Optional[str] = None
+    tool_ids: List[str] = Field(default_factory=list)
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    payload: Any = None
+    result: Any = None
+
+
+class RunSnapshot(BaseModel):
+    step_index: int
+    timestamp: str
+    state: Dict[str, Any]
+
+
+class RunStateResponse(BaseModel):
+    run_id: str
+    snapshots: List[RunSnapshot]
+    derived: bool = False
 
 
 def _extract_boundary(content_type: str) -> bytes:
@@ -179,96 +340,6 @@ def _parse_multipart_file(
         return filename, mime, content
 
     raise ValueError(f"Multipart field '{field_name}' was not found.")
-
-
-class ToolSummary(BaseModel):
-    id: str
-    name: str
-    kind: str = "local"
-    description: str = ""
-    enabled: bool
-
-
-class ToolsResponse(BaseModel):
-    tools: List[ToolSummary]
-
-
-class WorkflowCompileRequest(BaseModel):
-    task: str
-    context: Optional[Dict[str, Any]] = None
-    workflow_type: Optional[WorkflowType] = None
-
-
-class WorkflowGraph(BaseModel):
-    nodes: List[Dict[str, Any]] = Field(default_factory=list)
-    edges: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class WorkflowCompileResponse(BaseModel):
-    workflow_id: str
-    workflow_type: WorkflowType
-    graph: WorkflowGraph
-
-
-class WorkflowRunRequest(BaseModel):
-    workflow_id: str
-    input: Dict[str, Any]
-
-
-class WorkflowRunResponse(BaseModel):
-    run_id: str
-    workflow_id: str
-    workflow_type: str
-    status: str
-    output: Dict[str, Any]
-    steps: List[Dict[str, Any]]
-
-
-class RunStepError(BaseModel):
-    message: str
-    stack: Optional[str] = None
-
-
-class RunLogStep(BaseModel):
-    step_index: int
-    name: str
-    status: Literal["ok", "error"]
-    started_at: str
-    ended_at: str
-    input: Any = None
-    output: Any = None
-    error: Optional[RunStepError] = None
-
-
-class RunLogsResponse(BaseModel):
-    run_id: str
-    steps: List[RunLogStep]
-
-
-class RunDetailResponse(BaseModel):
-    run_id: str
-    kind: Literal["chat", "workflow"]
-    status: str
-    workflow_id: str
-    workflow_type: Optional[str] = None
-    model_id: Optional[str] = None
-    tool_ids: List[str] = Field(default_factory=list)
-    started_at: Optional[str] = None
-    ended_at: Optional[str] = None
-    payload: Any = None
-    result: Any = None
-
-
-class RunSnapshot(BaseModel):
-    step_index: int
-    timestamp: str
-    state: Dict[str, Any]
-
-
-class RunStateResponse(BaseModel):
-    run_id: str
-    snapshots: List[RunSnapshot]
-    derived: bool = False
 
 
 def _json_loads(value: Optional[str]) -> Any:
@@ -378,6 +449,288 @@ def _derive_state_snapshots(payload: Any, steps: List[Dict[str, Any]]) -> List[D
         )
 
     return snapshots
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_tool_id_fragment(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip().lower())
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized or "custom_tool"
+
+
+def _generate_tool_id(name: str, existing_ids: set[str]) -> str:
+    base = f"tool.custom.{_normalize_tool_id_fragment(name)}"
+    if base not in existing_ids:
+        return base
+
+    index = 2
+    while f"{base}_{index}" in existing_ids:
+        index += 1
+    return f"{base}_{index}"
+
+
+def _generate_workflow_id(name: str, existing_ids: set[str]) -> str:
+    base = f"workflow.custom.{_normalize_tool_id_fragment(name)}"
+    if base not in existing_ids:
+        return base
+
+    index = 2
+    while f"{base}_{index}" in existing_ids:
+        index += 1
+    return f"{base}_{index}"
+
+
+def _is_valid_http_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _normalize_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    normalized: Dict[str, str] = {}
+    for key, value in headers.items():
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        normalized[key_text] = str(value)
+    return normalized
+
+
+def _is_valid_tool_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-zA-Z0-9_.-]+", value))
+
+
+def _is_valid_workflow_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[a-zA-Z0-9_.-]+", value))
+
+
+def _normalize_tool_config(tool_type: ToolType, config: Dict[str, Any]) -> Dict[str, Any]:
+    if tool_type == "http":
+        url = str(config.get("url") or "").strip()
+        if not _is_valid_http_url(url):
+            raise ValueError("Tool URL must be a valid http(s) URL.")
+
+        method = str(config.get("method") or "POST").strip().upper()
+        if method not in {"GET", "POST"}:
+            method = "POST"
+
+        timeout_raw = config.get("timeout_ms")
+        timeout_ms = 8000
+        if isinstance(timeout_raw, (int, float)):
+            timeout_ms = int(timeout_raw)
+        if timeout_ms <= 0:
+            raise ValueError("timeout_ms must be greater than 0.")
+
+        headers = config.get("headers")
+        normalized_headers = _normalize_headers(headers if isinstance(headers, dict) else {})
+
+        return {
+            "url": url,
+            "method": method,
+            "headers": normalized_headers,
+            "timeout_ms": timeout_ms,
+        }
+
+    if tool_type == "python":
+        code = str(config.get("code") or "")
+        if not code.strip():
+            raise ValueError("Python tool requires non-empty config.code.")
+
+        timeout_raw = config.get("timeout_ms")
+        timeout_ms = 5000
+        if isinstance(timeout_raw, (int, float)):
+            timeout_ms = int(timeout_raw)
+        if timeout_ms <= 0:
+            raise ValueError("timeout_ms must be greater than 0.")
+
+        allowed_imports_raw = config.get("allowed_imports")
+        allowed_imports: List[str] = []
+        if isinstance(allowed_imports_raw, list):
+            for item in allowed_imports_raw:
+                token = str(item).strip()
+                if token:
+                    allowed_imports.append(token)
+
+        return {
+            "code": code,
+            "timeout_ms": timeout_ms,
+            "allowed_imports": sorted(set(allowed_imports)),
+        }
+
+    prompt_template = str(config.get("prompt_template") or "")
+    if not prompt_template.strip():
+        raise ValueError("Prompt tool requires non-empty config.prompt_template.")
+
+    timeout_raw = config.get("timeout_ms")
+    timeout_ms = 30000
+    if isinstance(timeout_raw, (int, float)):
+        timeout_ms = int(timeout_raw)
+    if timeout_ms <= 0:
+        raise ValueError("timeout_ms must be greater than 0.")
+
+    temperature_raw = config.get("temperature")
+    temperature = 0.2
+    if isinstance(temperature_raw, (int, float)):
+        temperature = float(temperature_raw)
+
+    return {
+        "prompt_template": prompt_template,
+        "system_prompt": str(config.get("system_prompt") or ""),
+        "temperature": temperature,
+        "timeout_ms": timeout_ms,
+    }
+
+
+def _validate_workflow_graph(graph_payload: WorkflowGraphSchema) -> Dict[str, Any]:
+    nodes = graph_payload.nodes
+    edges = graph_payload.edges
+
+    if not nodes:
+        raise ValueError("Workflow graph requires at least one node.")
+
+    node_ids: set[str] = set()
+    normalized_nodes: List[Dict[str, Any]] = []
+    start_count = 0
+    end_count = 0
+
+    for node in nodes:
+        node_id = node.id.strip()
+        if not node_id:
+            raise ValueError("Workflow node id is required.")
+        if node_id in node_ids:
+            raise ValueError(f"Duplicate node id '{node_id}'.")
+        node_ids.add(node_id)
+
+        node_type = str(node.type).strip().lower()
+        config = dict(node.config or {})
+
+        if node_type == "start":
+            start_count += 1
+        elif node_type == "end":
+            end_count += 1
+        elif node_type == "llm":
+            prompt_template = str(config.get("prompt_template") or "")
+            if not prompt_template.strip():
+                raise ValueError(f"Node '{node_id}' (llm) requires config.prompt_template.")
+            if "output_key" in config:
+                config["output_key"] = str(config.get("output_key") or "").strip()
+        elif node_type == "tool":
+            tool_id = str(config.get("tool_id") or "")
+            if not tool_id.strip():
+                raise ValueError(f"Node '{node_id}' (tool) requires config.tool_id.")
+            input_map = config.get("input_map")
+            if input_map is not None and not isinstance(input_map, dict):
+                raise ValueError(f"Node '{node_id}' input_map must be an object.")
+            config["tool_id"] = tool_id.strip()
+            config["input_map"] = input_map if isinstance(input_map, dict) else {}
+            if "output_key" in config:
+                config["output_key"] = str(config.get("output_key") or "").strip()
+        elif node_type == "condition":
+            field = str(config.get("field") or "").strip()
+            operator = str(config.get("operator") or "").strip().lower()
+            if not field:
+                raise ValueError(f"Node '{node_id}' (condition) requires config.field.")
+            if operator not in {"equals", "contains", "gt", "lt", "exists", "not_exists", "in"}:
+                raise ValueError(
+                    f"Node '{node_id}' has invalid condition operator '{operator}'."
+                )
+            config["field"] = field
+            config["operator"] = operator
+        else:
+            raise ValueError(f"Unsupported node type '{node_type}'.")
+
+        normalized_nodes.append(
+            {
+                "id": node_id,
+                "type": node_type,
+                "config": config,
+            }
+        )
+
+    if start_count != 1:
+        raise ValueError("Workflow graph must include exactly one start node.")
+    if end_count != 1:
+        raise ValueError("Workflow graph must include exactly one end node.")
+
+    normalized_edges: List[Dict[str, Any]] = []
+    outgoing: Dict[str, List[Dict[str, Any]]] = {node_id: [] for node_id in node_ids}
+    for edge in edges:
+        from_node = edge.from_node.strip()
+        to_node = edge.to.strip()
+        condition = str(edge.condition or "always").strip().lower()
+
+        if from_node not in node_ids:
+            raise ValueError(f"Edge references unknown from node '{from_node}'.")
+        if to_node not in node_ids:
+            raise ValueError(f"Edge references unknown to node '{to_node}'.")
+        if condition not in {"always", "true", "false"}:
+            raise ValueError(f"Edge condition must be always|true|false, got '{condition}'.")
+
+        record = {"from": from_node, "to": to_node, "condition": condition}
+        normalized_edges.append(record)
+        outgoing[from_node].append(record)
+
+    node_type_by_id = {node["id"]: node["type"] for node in normalized_nodes}
+    start_node_id = next(node["id"] for node in normalized_nodes if node["type"] == "start")
+    end_node_id = next(node["id"] for node in normalized_nodes if node["type"] == "end")
+
+    if len(outgoing[start_node_id]) == 0:
+        raise ValueError("Start node must have at least one outgoing edge.")
+
+    for node_id, node_type in node_type_by_id.items():
+        outgoing_edges = outgoing.get(node_id, [])
+        if node_type == "end":
+            if outgoing_edges:
+                raise ValueError("End node cannot have outgoing edges.")
+            continue
+
+        if node_type == "condition":
+            conditions = {str(edge.get("condition") or "always") for edge in outgoing_edges}
+            if "true" not in conditions or "false" not in conditions:
+                raise ValueError(
+                    f"Condition node '{node_id}' must have both true and false edges."
+                )
+            continue
+
+        if len(outgoing_edges) == 0:
+            raise ValueError(f"Node '{node_id}' must have at least one outgoing edge.")
+
+        for edge in outgoing_edges:
+            if str(edge.get("condition") or "always") != "always":
+                raise ValueError(
+                    f"Only condition nodes may use true/false edges (node '{node_id}')."
+                )
+
+    if not any(edge["to"] == end_node_id for edge in normalized_edges):
+        raise ValueError("Workflow graph must route to the end node.")
+
+    return {
+        "nodes": normalized_nodes,
+        "edges": normalized_edges,
+    }
+
+
+def _normalize_workflow_summary(item: Dict[str, Any]) -> Dict[str, Any]:
+    workflow_id = str(item.get("id") or "")
+    title = str(item.get("title") or item.get("name") or workflow_id)
+    workflow_type = str(item.get("type") or "custom")
+    version = str(item.get("version") or workflow_id.split(".")[-1] or "v1")
+    status = str(item.get("status") or "available")
+    source = str(item.get("source") or "builtin")
+    enabled = bool(item.get("enabled", status != "disabled"))
+    return {
+        "id": workflow_id,
+        "title": title,
+        "name": title,
+        "description": str(item.get("description") or ""),
+        "type": workflow_type,
+        "version": version,
+        "status": status,
+        "source": source,
+        "enabled": enabled,
+    }
 
 
 def _resolve_db_path() -> Path:
@@ -538,13 +891,192 @@ async def vision_models() -> ModelsResponse:
 @app.get("/workflows", response_model=WorkflowsResponse)
 async def workflows() -> WorkflowsResponse:
     payload = graph.list_workflows()
-    return WorkflowsResponse(workflows=[WorkflowSummary(**item) for item in payload])
+    items = [
+        WorkflowSummary(**_normalize_workflow_summary(item))
+        for item in payload
+        if isinstance(item, dict)
+    ]
+    return WorkflowsResponse(workflows=items)
+
+
+@app.post("/builder/workflows", response_model=WorkflowDefinitionResponse)
+async def create_or_update_builder_workflow(
+    request: CreateWorkflowRequest,
+) -> WorkflowDefinitionResponse:
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Workflow name is required.")
+
+    try:
+        normalized_graph = _validate_workflow_graph(request.graph)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    existing_workflows = graph.list_workflows()
+    existing_ids = {str(item.get("id") or "").strip() for item in existing_workflows}
+    builtin_ids = {
+        str(item.get("id") or "").strip()
+        for item in existing_workflows
+        if str(item.get("source") or "builtin") == "builtin"
+    }
+
+    requested_id = str(request.id or "").strip()
+    if requested_id and not _is_valid_workflow_id(requested_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Workflow id may only contain letters, numbers, '.', '_' and '-'.",
+        )
+
+    workflow_id = requested_id or _generate_workflow_id(name, existing_ids)
+    if workflow_id in builtin_ids:
+        raise HTTPException(status_code=409, detail=f"Workflow id '{workflow_id}' is reserved.")
+
+    existing_custom = db.get_workflow(workflow_id)
+    now = _now_utc_iso()
+    created_at = str(existing_custom.get("created_at") or now) if existing_custom else now
+
+    record: Dict[str, Any] = {
+        "id": workflow_id,
+        "name": name,
+        "description": request.description.strip(),
+        "enabled": bool(request.enabled),
+        "graph": normalized_graph,
+        "created_at": created_at,
+        "updated_at": now,
+    }
+    db.upsert_workflow(record)
+
+    persisted = db.get_workflow(workflow_id)
+    if not persisted:
+        raise HTTPException(status_code=500, detail="Workflow was not persisted.")
+    return WorkflowDefinitionResponse(**persisted)
+
+
+@app.get("/builder/workflows/{workflow_id}", response_model=WorkflowDefinitionResponse)
+async def get_builder_workflow(workflow_id: str) -> WorkflowDefinitionResponse:
+    payload = db.get_workflow(workflow_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Workflow not found.")
+    return WorkflowDefinitionResponse(**payload)
+
+
+@app.patch("/builder/workflows/{workflow_id}", response_model=WorkflowDefinitionResponse)
+async def update_builder_workflow(
+    workflow_id: str,
+    request: UpdateWorkflowRequest,
+) -> WorkflowDefinitionResponse:
+    existing = db.get_workflow(workflow_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Workflow not found.")
+
+    name = str(existing.get("name") or workflow_id)
+    if request.name is not None:
+        next_name = request.name.strip()
+        if not next_name:
+            raise HTTPException(status_code=400, detail="Workflow name cannot be empty.")
+        name = next_name
+
+    description = str(existing.get("description") or "")
+    if request.description is not None:
+        description = request.description.strip()
+
+    enabled = bool(existing.get("enabled", True))
+    if request.enabled is not None:
+        enabled = bool(request.enabled)
+
+    next_graph = existing.get("graph") if isinstance(existing.get("graph"), dict) else {"nodes": [], "edges": []}
+    if request.graph is not None:
+        try:
+            next_graph = _validate_workflow_graph(request.graph)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    record: Dict[str, Any] = {
+        "id": workflow_id,
+        "name": name,
+        "description": description,
+        "enabled": enabled,
+        "graph": next_graph,
+        "created_at": str(existing.get("created_at") or _now_utc_iso()),
+        "updated_at": _now_utc_iso(),
+    }
+    db.upsert_workflow(record)
+
+    payload = db.get_workflow(workflow_id)
+    if not payload:
+        raise HTTPException(status_code=500, detail="Workflow update did not persist.")
+    return WorkflowDefinitionResponse(**payload)
 
 
 @app.get("/tools", response_model=ToolsResponse)
 async def tools() -> ToolsResponse:
     payload = graph.list_tools()
     return ToolsResponse(tools=[ToolSummary(**item) for item in payload])
+
+
+@app.post("/builder/tools", response_model=ToolSummary)
+async def create_builder_tool(request: CreateToolRequest) -> ToolSummary:
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tool name is required.")
+
+    existing_tools = graph.list_tools()
+    existing_ids = {str(item.get("id") or "").strip() for item in existing_tools}
+
+    requested_id = str(request.id or "").strip()
+    if requested_id and not _is_valid_tool_id(requested_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Tool id may only contain letters, numbers, '.', '_' and '-'.",
+        )
+    tool_id = requested_id or _generate_tool_id(name, existing_ids)
+    if tool_id in existing_ids:
+        raise HTTPException(status_code=409, detail=f"Tool id '{tool_id}' already exists.")
+
+    try:
+        normalized_config = _normalize_tool_config(request.type, request.config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    now = _now_utc_iso()
+    record: Dict[str, Any] = {
+        "id": tool_id,
+        "name": name,
+        "kind": request.kind,
+        "type": request.type,
+        "description": request.description.strip(),
+        "enabled": bool(request.enabled),
+        "config": normalized_config,
+        "input_schema": request.input_schema,
+        "output_schema": request.output_schema,
+        "created_at": now,
+        "updated_at": now,
+    }
+    db.upsert_tool(record)
+
+    created = db.get_tool(tool_id)
+    if not created:
+        raise HTTPException(status_code=500, detail="Tool was not persisted.")
+    return ToolSummary(**created)
+
+
+@app.patch("/tools/{tool_id}", response_model=ToolSummary)
+async def update_tool(tool_id: str, request: UpdateToolRequest) -> ToolSummary:
+    existing = db.get_tool(tool_id)
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail="Tool not found or not editable.",
+        )
+
+    updated = db.set_tool_enabled(tool_id, bool(request.enabled))
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to update tool.")
+
+    payload = db.get_tool(tool_id)
+    if not payload:
+        raise HTTPException(status_code=500, detail="Tool update did not persist.")
+    return ToolSummary(**payload)
 
 
 @app.post("/workflow/compile", response_model=WorkflowCompileResponse)
@@ -667,22 +1199,38 @@ async def run_state(run_id: str) -> RunStateResponse:
 
 # curl -X GET http://localhost:8000/models
 # curl -X GET http://localhost:8000/workflows
+#
+# curl -X POST http://localhost:8000/builder/tools \
+#   -H "Content-Type: application/json" \
+#   -d '{"name":"Acme Search","kind":"external","description":"Query Acme API","type":"http","config":{"url":"https://api.example.com/search","method":"POST","headers":{"Authorization":"Bearer token"},"timeout_ms":8000},"enabled":true}'
+#
 # curl -X GET http://localhost:8000/tools
+#
+# curl -X PATCH http://localhost:8000/tools/tool.custom.acme_search \
+#   -H "Content-Type: application/json" \
+#   -d '{"enabled":false}'
+#
+# curl -X POST http://localhost:8000/builder/workflows \
+#   -H "Content-Type: application/json" \
+#   -d '{"name":"Customer Triage","description":"Route customer queries","enabled":true,"graph":{"nodes":[{"id":"start","type":"start","config":{}},{"id":"llm_1","type":"llm","config":{"prompt_template":"Classify: {{query}}","output_key":"classification"}},{"id":"end","type":"end","config":{"response_template":"Result: {{artifacts.classification}}"}}],"edges":[{"from":"start","to":"llm_1","condition":"always"},{"from":"llm_1","to":"end","condition":"always"}]}}'
+#
+# curl -X GET http://localhost:8000/builder/workflows/workflow.custom.customer_triage
+#
+# curl -X PATCH http://localhost:8000/builder/workflows/workflow.custom.customer_triage \
+#   -H "Content-Type: application/json" \
+#   -d '{"enabled":false}'
+#
 # curl -X POST http://localhost:8000/chat \
 #   -H "Content-Type: application/json" \
-#   -d '{"message":"Summarize this repo","workflow_id":"moderate.v1","model_id":"llama3.1:8b","tool_ids":["filesystem.read"],"context":{"tone":"concise"}}'
+#   -d '{"message":"Find recent alerts","workflow_id":"complex.v1","model_id":"llama3.1:8b","tool_ids":["tool.custom.acme_search"]}'
 #
 # curl -X POST http://localhost:8000/workflow/compile \
 #   -H "Content-Type: application/json" \
 #   -d '{"task":"Summarize architecture changes","workflow_type":"complex","context":{"repo":"saturday_agent"}}'
 #
-# curl -X POST http://localhost:8000/workflow/compile \
-#   -H "Content-Type: application/json" \
-#   -d '{"task":"Say hello in one sentence"}'
-#
 # curl -X POST http://localhost:8000/workflow/run \
 #   -H "Content-Type: application/json" \
-#   -d '{"workflow_id":"moderate.v1","input":{"task":"Explain this repo"}}'
+#   -d '{"workflow_id":"workflow.custom.customer_triage","input":{"task":"classify this","context":{}}}'
 #
 # curl -X GET http://localhost:8000/runs/<run_id>
 # curl -X GET http://localhost:8000/runs/<run_id>/logs

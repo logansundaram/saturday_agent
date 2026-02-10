@@ -5,7 +5,7 @@ import ToolCard, {
 } from "../components/tools/ToolCard";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import { getTools, type Tool } from "../lib/api";
+import { getTools, setToolEnabled, type Tool } from "../lib/api";
 
 const TOOL_CATEGORY_ORDER: ToolCategory[] = [
   "local",
@@ -57,6 +57,10 @@ const sortCatalogTools = (tools: CatalogTool[]): CatalogTool[] => {
 
 const normalize = (value?: string): string => (value ?? "").trim().toLowerCase();
 
+const isCustomTool = (tool: Tool): boolean =>
+  normalize(tool.source) === "custom" ||
+  ["http", "python", "prompt"].includes(normalize(tool.type));
+
 const classifyTool = (tool: Tool): ToolCategory => {
   const id = normalize(tool.id);
   const name = normalize(tool.name);
@@ -102,6 +106,7 @@ export default function ToolsPage() {
   const [tools, setTools] = useState<CatalogTool[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [togglePending, setTogglePending] = useState<Record<string, boolean>>({});
   const [health, setHealth] = useState<{ ok: boolean; detail?: string }>({
     ok: false,
   });
@@ -138,6 +143,46 @@ export default function ToolsPage() {
     void fetchTools(true);
   }, [fetchTools]);
 
+  useEffect(() => {
+    const handler = () => {
+      void fetchTools(false);
+    };
+    window.addEventListener("tools:updated", handler);
+    return () => {
+      window.removeEventListener("tools:updated", handler);
+    };
+  }, [fetchTools]);
+
+  const toggleTool = useCallback(
+    async (tool: CatalogTool) => {
+      if (!isCustomTool(tool)) {
+        return;
+      }
+      setTogglePending((prev) => ({ ...prev, [tool.id]: true }));
+      try {
+        const updated = await setToolEnabled(tool.id, !tool.enabled);
+        setTools((prev) =>
+          prev.map((item) =>
+            item.id === tool.id
+              ? {
+                  ...item,
+                  enabled: updated.enabled,
+                  updated_at: updated.updated_at,
+                }
+              : item
+          )
+        );
+        window.dispatchEvent(new CustomEvent("tools:updated"));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Unable to update tool.";
+        setError(message);
+      } finally {
+        setTogglePending((prev) => ({ ...prev, [tool.id]: false }));
+      }
+    },
+    []
+  );
+
   const groupedTools = useMemo(() => {
     const groups: Record<ToolCategory, CatalogTool[]> = {
       local: [],
@@ -165,6 +210,7 @@ export default function ToolsPage() {
 
   const totalTools = tools.length;
   const enabledTools = tools.filter((tool) => tool.enabled).length;
+  const customTools = tools.filter((tool) => isCustomTool(tool)).length;
   const statusLabel = health.ok ? "Backend Connected" : "Backend Unavailable";
   const statusClass = health.ok
     ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-100"
@@ -206,6 +252,12 @@ export default function ToolsPage() {
             <p className="text-xs text-secondary">
               {enabledTools}/{totalTools} enabled
             </p>
+          </div>
+
+          <div className="mb-3 flex flex-wrap gap-2">
+            <Badge className="border border-sky-400/40 bg-sky-500/10 text-sky-100">
+              {customTools} custom
+            </Badge>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -268,7 +320,35 @@ export default function ToolsPage() {
 
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
                   {groupedTools[category].map((tool) => (
-                    <ToolCard key={`${category}-${tool.id}`} tool={tool} />
+                    <div key={`${category}-${tool.id}`} className="space-y-2">
+                      <div className="flex items-center justify-between gap-2 px-1">
+                        <div className="flex items-center gap-2">
+                          {isCustomTool(tool) ? (
+                            <Badge className="border border-sky-400/40 bg-sky-500/10 text-[11px] text-sky-100">
+                              Custom
+                            </Badge>
+                          ) : null}
+                          <span className="text-[11px] uppercase tracking-wide text-secondary">
+                            {tool.type}
+                          </span>
+                        </div>
+                        {isCustomTool(tool) ? (
+                          <Button
+                            type="button"
+                            className="h-7 rounded-full border border-subtle bg-transparent px-3 text-[11px] text-secondary hover:text-primary disabled:opacity-60"
+                            disabled={Boolean(togglePending[tool.id])}
+                            onClick={() => void toggleTool(tool)}
+                          >
+                            {togglePending[tool.id]
+                              ? "Saving..."
+                              : tool.enabled
+                              ? "Disable"
+                              : "Enable"}
+                          </Button>
+                        ) : null}
+                      </div>
+                      <ToolCard tool={tool} />
+                    </div>
                   ))}
                 </div>
               </section>

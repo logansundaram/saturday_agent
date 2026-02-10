@@ -32,6 +32,12 @@ import {
 
 const MAX_TEXTAREA_HEIGHT = 160;
 const VISION_TOOL_ID = "vision.analyze";
+const CUSTOM_TOOL_TYPES = new Set(["http", "python", "prompt"]);
+
+const normalize = (value?: string): string => (value ?? "").trim().toLowerCase();
+
+const isCustomTool = (tool: Tool): boolean =>
+  normalize(tool.source) === "custom" || CUSTOM_TOOL_TYPES.has(normalize(tool.type));
 
 const toImageFiles = (files: FileList | File[] | null): File[] => {
   if (!files) {
@@ -163,6 +169,13 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
     }
     return chatState.messagesByThread[chatState.activeThreadId] ?? [];
   }, [chatState.activeThreadId, chatState.messagesByThread]);
+  const toolEnabledMap = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const tool of tools) {
+      map.set(tool.id, Boolean(tool.enabled));
+    }
+    return map;
+  }, [tools]);
 
   useEffect(() => {
     if (chatState.threads.length > 0 && chatState.activeThreadId) {
@@ -322,7 +335,9 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
       if (toolIds.size === 0) {
         return [];
       }
-      const selectedFromStorage = prev.filter((id) => toolIds.has(id));
+      const selectedFromStorage = prev.filter(
+        (id) => toolIds.has(id) && toolItems.some((tool) => tool.id === id && tool.enabled)
+      );
       if (selectedFromStorage.length > 0) {
         return selectedFromStorage;
       }
@@ -352,13 +367,70 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
     setAutoScroll(atBottom);
   }, []);
 
-  const toggleTool = useCallback((toolId: string) => {
-    setSelectedToolIds((prev) => {
-      if (prev.includes(toolId)) {
-        return prev.filter((id) => id !== toolId);
+  const toggleTool = useCallback(
+    (toolId: string) => {
+      setSelectedToolIds((prev) => {
+        if (prev.includes(toolId)) {
+          return prev.filter((id) => id !== toolId);
+        }
+        if (!toolEnabledMap.get(toolId)) {
+          return prev;
+        }
+        return [...prev, toolId];
+      });
+    },
+    [toolEnabledMap]
+  );
+
+  useEffect(() => {
+    const handler = async () => {
+      try {
+        const toolItems = await getTools();
+        const available = new Set(toolItems.map((tool) => tool.id));
+        setTools(toolItems);
+        setSelectedToolIds((prev) =>
+          prev.filter(
+            (toolId) =>
+              available.has(toolId) &&
+              toolItems.some((tool) => tool.id === toolId && tool.enabled)
+          )
+        );
+      } catch {
+        // Keep current state if refresh fails.
       }
-      return [...prev, toolId];
-    });
+    };
+    window.addEventListener("tools:updated", handler);
+    return () => {
+      window.removeEventListener("tools:updated", handler);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handler = async () => {
+      try {
+        const workflowItems = await getWorkflows();
+        const available = new Set(workflowItems.map((workflow) => workflow.id));
+        setWorkflows(workflowItems);
+        setSelectedWorkflowId((prev) => {
+          if (!workflowItems.length) {
+            return "";
+          }
+          if (available.has(prev)) {
+            return prev;
+          }
+          const preferredWorkflowId = workflowItems.find(
+            (item) => item.id === "simple.v1"
+          )?.id;
+          return preferredWorkflowId ?? workflowItems[0]?.id ?? "";
+        });
+      } catch {
+        // Keep current workflow options if refresh fails.
+      }
+    };
+    window.addEventListener("workflows:updated", handler);
+    return () => {
+      window.removeEventListener("workflows:updated", handler);
+    };
   }, []);
 
   const uploadFiles = useCallback(async (files: File[]) => {
@@ -768,7 +840,7 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
                 ) : (
                   workflows.map((workflow) => (
                     <option key={workflow.id} value={workflow.id}>
-                      {workflow.title}
+                      {workflow.title || workflow.name || workflow.id}
                     </option>
                   ))
                 )}
@@ -883,10 +955,20 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
                         return (
                           <label
                             key={tool.id}
-                            className="flex cursor-pointer items-center justify-between gap-3 rounded-md px-2 py-1.5 hover:bg-white/5"
+                            className={
+                              "flex items-center justify-between gap-3 rounded-md px-2 py-1.5 " +
+                              (tool.enabled ? "cursor-pointer hover:bg-white/5" : "opacity-60")
+                            }
                           >
                             <div className="min-w-0">
-                              <p className="truncate text-sm text-primary">{tool.name}</p>
+                              <p className="truncate text-sm text-primary">
+                                {tool.name}
+                                {isCustomTool(tool) ? (
+                                  <span className="ml-1.5 rounded-full border border-sky-400/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-100">
+                                    Custom
+                                  </span>
+                                ) : null}
+                              </p>
                               {tool.description ? (
                                 <p className="truncate text-xs text-secondary">
                                   {tool.description}
@@ -898,6 +980,7 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
                               checked={checked}
                               onChange={() => toggleTool(tool.id)}
                               className="h-4 w-4 rounded border-subtle bg-transparent"
+                              disabled={!tool.enabled}
                             />
                           </label>
                         );

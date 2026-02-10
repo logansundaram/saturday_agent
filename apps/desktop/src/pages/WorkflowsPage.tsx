@@ -50,6 +50,9 @@ const sortCatalogWorkflows = (workflows: CatalogWorkflow[]): CatalogWorkflow[] =
 
 const normalize = (value?: string): string => (value ?? "").trim().toLowerCase();
 
+const isCustomWorkflow = (workflow: Workflow): boolean =>
+  normalize(workflow.source) === "custom" || normalize(workflow.type) === "custom";
+
 const classifyWorkflow = (workflow: Workflow): WorkflowCategory => {
   const type = normalize(workflow.type);
   if (type === "simple") {
@@ -125,6 +128,16 @@ export default function WorkflowsPage() {
     void fetchWorkflows(true);
   }, [fetchWorkflows]);
 
+  useEffect(() => {
+    const handler = () => {
+      void fetchWorkflows(false);
+    };
+    window.addEventListener("workflows:updated", handler);
+    return () => {
+      window.removeEventListener("workflows:updated", handler);
+    };
+  }, [fetchWorkflows]);
+
   const groupedWorkflows = useMemo(() => {
     const groups: Record<WorkflowCategory, CatalogWorkflow[]> = {
       simple: [],
@@ -156,6 +169,9 @@ export default function WorkflowsPage() {
   const selectedWorkflow = workflows.find(
     (workflow) => workflow.id === selectedWorkflowId
   );
+  const customWorkflowCount = workflows.filter((workflow) =>
+    isCustomWorkflow(workflow)
+  ).length;
   const statusLabel = health.ok ? "Backend Connected" : "Backend Unavailable";
   const statusClass = health.ok
     ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-100"
@@ -201,6 +217,9 @@ export default function WorkflowsPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <Badge className="border border-sky-400/40 bg-sky-500/10 text-sky-100">
+              {customWorkflowCount} custom
+            </Badge>
             {WORKFLOW_CATEGORY_ORDER.map((category) => (
               <div
                 key={category}
@@ -273,14 +292,57 @@ export default function WorkflowsPage() {
 
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
                   {groupedWorkflows[category].map((workflow) => (
-                    <WorkflowCard
-                      key={`${category}-${workflow.id}`}
-                      workflow={workflow}
-                      selected={selectedWorkflowId === workflow.id}
-                      onSelect={(item) => {
-                        setSelectedWorkflowId(item.id);
-                      }}
-                    />
+                    <div key={`${category}-${workflow.id}`} className="space-y-2">
+                      <div className="flex items-center justify-between gap-2 px-1">
+                        <div className="flex items-center gap-2">
+                          <Badge
+                            className={
+                              isCustomWorkflow(workflow)
+                                ? "border border-sky-400/40 bg-sky-500/10 text-[11px] text-sky-100"
+                                : "border border-white/10 bg-white/5 text-[11px] text-secondary"
+                            }
+                          >
+                            {isCustomWorkflow(workflow) ? "Custom" : "Built-in"}
+                          </Badge>
+                          <span className="text-[11px] uppercase tracking-wide text-secondary">
+                            {workflow.type}
+                          </span>
+                        </div>
+                        {isCustomWorkflow(workflow) ? (
+                          <Button
+                            type="button"
+                            className="h-7 rounded-full border border-subtle bg-transparent px-3 text-[11px] text-secondary hover:text-primary"
+                            onClick={() => {
+                              if (typeof window !== "undefined") {
+                                window.sessionStorage.setItem(
+                                  "saturday.builder.intent",
+                                  JSON.stringify({
+                                    tab: "workflows",
+                                    workflowId: workflow.id,
+                                  })
+                                );
+                                window.dispatchEvent(
+                                  new CustomEvent("dashboard:navigate", {
+                                    detail: {
+                                      page: "builder",
+                                    },
+                                  })
+                                );
+                              }
+                            }}
+                          >
+                            Edit in Builder
+                          </Button>
+                        ) : null}
+                      </div>
+                      <WorkflowCard
+                        workflow={workflow}
+                        selected={selectedWorkflowId === workflow.id}
+                        onSelect={(item) => {
+                          setSelectedWorkflowId(item.id);
+                        }}
+                      />
+                    </div>
                   ))}
                 </div>
               </section>

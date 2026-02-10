@@ -1,6 +1,4 @@
-import Chats from "./chats"
-
-type Page = "chat" | "models" | "tools" | "workflows" | "inspect";
+type Page = "chat" | "models" | "tools" | "builder" | "workflows" | "inspect";
 
 interface LeftNavProps{
     page : Page;
@@ -23,6 +21,9 @@ export default function LeftNav({page, onNavigate} : LeftNavProps){
                 </p>
                 <p className={itemClass("tools")} onClick={() => onNavigate("tools")}>
                     Tools
+                </p>
+                <p className={itemClass("builder")} onClick={() => onNavigate("builder")}>
+                    Builder
                 </p>
                 <p className={itemClass("workflows")} onClick={() => onNavigate("workflows")}>
                     Workflows

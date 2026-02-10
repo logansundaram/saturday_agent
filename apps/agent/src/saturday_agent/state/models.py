@@ -33,6 +33,74 @@ class ToolResultRecord(TypedDict):
     output: Dict[str, Any]
 
 
+class ToolHttpConfig(TypedDict, total=False):
+    url: str
+    method: str
+    headers: Dict[str, str]
+    timeout_ms: int
+
+
+class ToolPythonConfig(TypedDict, total=False):
+    code: str
+    timeout_ms: int
+    allowed_imports: List[str]
+
+
+class ToolPromptConfig(TypedDict, total=False):
+    prompt_template: str
+    system_prompt: str
+    temperature: float
+    timeout_ms: int
+
+
+ToolConfig = ToolHttpConfig | ToolPythonConfig | ToolPromptConfig
+
+
+class ToolDefinition(TypedDict, total=False):
+    id: str
+    name: str
+    kind: str
+    type: str
+    description: str
+    enabled: bool
+    source: str
+    config: ToolConfig
+    input_schema: Any
+    output_schema: Any
+    created_at: str
+    updated_at: str
+
+
+class WorkflowNode(TypedDict, total=False):
+    id: str
+    type: str
+    config: Dict[str, Any]
+
+
+class WorkflowEdge(TypedDict, total=False):
+    from_: str
+    to: str
+    condition: str
+
+
+class WorkflowGraph(TypedDict, total=False):
+    nodes: List[WorkflowNode]
+    edges: List[Dict[str, Any]]
+
+
+class WorkflowDefinition(TypedDict, total=False):
+    id: str
+    name: str
+    title: str
+    description: str
+    enabled: bool
+    source: str
+    type: str
+    graph: WorkflowGraph
+    created_at: str
+    updated_at: str
+
+
 class WorkflowState(TypedDict):
     task: str
     context: Dict[str, Any]
@@ -44,6 +112,8 @@ class WorkflowState(TypedDict):
     artifacts: Dict[str, Any]
     tool_calls: List[ToolCallRecord]
     tool_results: List[ToolResultRecord]
+    tool_defs: List[ToolDefinition]
+    workflow_defs: List[WorkflowDefinition]
     trace: List[StepSummary]
     verify_ok: Optional[bool]
     verify_notes: Optional[str]
@@ -100,6 +170,20 @@ def build_initial_state(
         raw_vision_model = options_map.get("vision_model_id")
     vision_model_id = str(raw_vision_model).strip() if raw_vision_model else None
 
+    raw_tool_defs = context_map.get("tool_defs")
+    tool_defs = (
+        [dict(item) for item in raw_tool_defs if isinstance(item, Mapping)]
+        if isinstance(raw_tool_defs, list)
+        else []
+    )
+
+    raw_workflow_defs = context_map.get("workflow_defs")
+    workflow_defs = (
+        [dict(item) for item in raw_workflow_defs if isinstance(item, Mapping)]
+        if isinstance(raw_workflow_defs, list)
+        else []
+    )
+
     return WorkflowState(
         task=str(task or ""),
         context=context_map,
@@ -111,6 +195,8 @@ def build_initial_state(
         artifacts={},
         tool_calls=[],
         tool_results=[],
+        tool_defs=tool_defs,
+        workflow_defs=workflow_defs,
         trace=[],
         verify_ok=None,
         verify_notes=None,

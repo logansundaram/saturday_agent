@@ -2,13 +2,21 @@ export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 const REQUEST_TIMEOUT_MS = 10000;
-const CHAT_REQUEST_TIMEOUT_MS = Number(
-  import.meta.env.VITE_CHAT_TIMEOUT_MS ?? "180000"
-);
+// 0 disables client-side timeout for long-running chat/workflow runs.
+const chatTimeoutMsRaw = Number(import.meta.env.VITE_CHAT_TIMEOUT_MS ?? "0");
+const CHAT_REQUEST_TIMEOUT_MS = Number.isFinite(chatTimeoutMsRaw)
+  ? chatTimeoutMsRaw
+  : 0;
 
-function resolveTimeout(timeoutMs: number): number {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    return REQUEST_TIMEOUT_MS;
+function resolveTimeout(
+  timeoutMs: number,
+  fallbackMs: number = REQUEST_TIMEOUT_MS
+): number | null {
+  if (!Number.isFinite(timeoutMs)) {
+    return fallbackMs;
+  }
+  if (timeoutMs <= 0) {
+    return null;
   }
   return timeoutMs;
 }
@@ -17,9 +25,89 @@ export type Workflow = {
   id: string;
   type: string;
   title: string;
+  name?: string;
   description?: string;
   version?: string;
   status?: string;
+  source?: "builtin" | "custom" | string;
+  enabled?: boolean;
+};
+
+export type WorkflowNode =
+  | { id: string; type: "start"; config?: Record<string, never> }
+  | {
+      id: string;
+      type: "llm";
+      config: { prompt_template: string; output_key?: string };
+    }
+  | {
+      id: string;
+      type: "tool";
+      config: {
+        tool_id: string;
+        input_map?: Record<string, string>;
+        output_key?: string;
+      };
+    }
+  | {
+      id: string;
+      type: "condition";
+      config: {
+        field: string;
+        operator:
+          | "equals"
+          | "contains"
+          | "gt"
+          | "lt"
+          | "exists"
+          | "not_exists"
+          | "in";
+        value?: any;
+      };
+    }
+  | { id: string; type: "end"; config: { response_template?: string } };
+
+export type WorkflowEdge = {
+  from: string;
+  to: string;
+  condition?: "always" | "true" | "false";
+};
+
+export type WorkflowDefinition = {
+  id: string;
+  name: string;
+  title?: string;
+  description: string;
+  enabled: boolean;
+  source: "builtin" | "custom" | string;
+  type: string;
+  graph: {
+    nodes: WorkflowNode[];
+    edges: WorkflowEdge[];
+  };
+  created_at: string;
+  updated_at: string;
+};
+
+export type CreateWorkflowPayload = {
+  id?: string;
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  graph: {
+    nodes: WorkflowNode[];
+    edges: WorkflowEdge[];
+  };
+};
+
+export type UpdateWorkflowPayload = {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  graph?: {
+    nodes: WorkflowNode[];
+    edges: WorkflowEdge[];
+  };
 };
 
 export type Model = {
@@ -29,12 +117,53 @@ export type Model = {
   status?: string;
 };
 
+export type HttpToolConfig = {
+  url: string;
+  method?: "GET" | "POST" | string;
+  headers?: Record<string, string>;
+  timeout_ms?: number;
+};
+
+export type PythonToolConfig = {
+  code: string;
+  timeout_ms?: number;
+  allowed_imports?: string[];
+};
+
+export type PromptToolConfig = {
+  prompt_template: string;
+  system_prompt?: string;
+  temperature?: number;
+  timeout_ms?: number;
+};
+
+export type ToolConfig = HttpToolConfig | PythonToolConfig | PromptToolConfig;
+
 export type Tool = {
   id: string;
   name: string;
-  kind?: string;
-  description?: string;
+  kind: "local" | "external" | string;
+  type: "http" | "python" | "prompt" | "builtin" | string;
+  description: string;
   enabled: boolean;
+  source?: "builtin" | "custom" | string;
+  config: ToolConfig;
+  input_schema?: any;
+  output_schema?: any;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CreateToolPayload = {
+  name: string;
+  id?: string;
+  kind: "local" | "external";
+  description: string;
+  type: "http" | "python" | "prompt";
+  enabled?: boolean;
+  config: ToolConfig;
+  input_schema?: any;
+  output_schema?: any;
 };
 
 export type ChatRunRequest = {
@@ -62,6 +191,20 @@ export type ChatRunResponse = {
   workflow_id: string;
   model_id: string;
   tool_ids: string[];
+};
+
+export type WorkflowRunRequest = {
+  workflow_id: string;
+  input: Record<string, any>;
+};
+
+export type WorkflowRunResponse = {
+  run_id: string;
+  workflow_id: string;
+  workflow_type: string;
+  status: string;
+  output: Record<string, any>;
+  steps: Array<Record<string, any>>;
 };
 
 export type Run = {
@@ -144,10 +287,11 @@ async function fetchJson<T>(
   timeoutMs: number = REQUEST_TIMEOUT_MS
 ): Promise<T> {
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(
-    () => controller.abort(),
-    resolveTimeout(timeoutMs)
-  );
+  const resolvedTimeoutMs = resolveTimeout(timeoutMs);
+  const timeoutId =
+    resolvedTimeoutMs === null
+      ? null
+      : window.setTimeout(() => controller.abort(), resolvedTimeoutMs);
 
   try {
     const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -183,7 +327,9 @@ async function fetchJson<T>(
     }
     throw new Error("Unable to reach backend API.");
   } finally {
-    window.clearTimeout(timeoutId);
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
   }
 }
 
@@ -196,6 +342,52 @@ export async function getWorkflows(): Promise<Workflow[]> {
     return [];
   }
   return payload.workflows;
+}
+
+export async function createWorkflow(
+  payload: CreateWorkflowPayload
+): Promise<WorkflowDefinition> {
+  return fetchJson<WorkflowDefinition>("/builder/workflows", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getWorkflowDefinition(
+  workflowId: string
+): Promise<WorkflowDefinition> {
+  return fetchJson<WorkflowDefinition>(
+    `/builder/workflows/${encodeURIComponent(workflowId)}`
+  );
+}
+
+export async function updateWorkflow(
+  workflowId: string,
+  payload: UpdateWorkflowPayload
+): Promise<WorkflowDefinition> {
+  return fetchJson<WorkflowDefinition>(
+    `/builder/workflows/${encodeURIComponent(workflowId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export async function setWorkflowEnabled(
+  workflowId: string,
+  enabled: boolean
+): Promise<WorkflowDefinition> {
+  return updateWorkflow(workflowId, { enabled });
+}
+
+export async function runWorkflow(
+  payload: WorkflowRunRequest
+): Promise<WorkflowRunResponse> {
+  return fetchJson<WorkflowRunResponse>("/workflow/run", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, CHAT_REQUEST_TIMEOUT_MS);
 }
 
 export async function getModels(): Promise<{
@@ -245,11 +437,29 @@ export async function getTools(): Promise<Tool[]> {
   return payload.tools;
 }
 
-export async function chatRun(req: ChatRunRequest): Promise<ChatRunResponse> {
-  return fetchJson<ChatRunResponse>("/chat", {
+export async function createTool(payload: CreateToolPayload): Promise<Tool> {
+  return fetchJson<Tool>("/builder/tools", {
     method: "POST",
-    body: JSON.stringify(req),
-  }, CHAT_REQUEST_TIMEOUT_MS);
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function setToolEnabled(id: string, enabled: boolean): Promise<Tool> {
+  return fetchJson<Tool>(`/tools/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export async function chatRun(req: ChatRunRequest): Promise<ChatRunResponse> {
+  return fetchJson<ChatRunResponse>(
+    "/chat",
+    {
+      method: "POST",
+      body: JSON.stringify(req),
+    },
+    CHAT_REQUEST_TIMEOUT_MS
+  );
 }
 
 export async function getRun(runId: string): Promise<Run> {
@@ -257,7 +467,9 @@ export async function getRun(runId: string): Promise<Run> {
 }
 
 export async function getRunLogs(runId: string): Promise<RunLogs> {
-  const payload = await fetchJson<RunLogsResponse>(`/runs/${encodeURIComponent(runId)}/logs`);
+  const payload = await fetchJson<RunLogsResponse>(
+    `/runs/${encodeURIComponent(runId)}/logs`
+  );
   return {
     run_id: typeof payload.run_id === "string" ? payload.run_id : runId,
     steps: Array.isArray(payload.steps) ? payload.steps : [],
@@ -288,10 +500,11 @@ export async function uploadArtifact(file: File): Promise<ArtifactUploadResponse
   formData.append("file", file);
 
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(
-    () => controller.abort(),
-    resolveTimeout(REQUEST_TIMEOUT_MS)
-  );
+  const resolvedTimeoutMs = resolveTimeout(REQUEST_TIMEOUT_MS);
+  const timeoutId =
+    resolvedTimeoutMs === null
+      ? null
+      : window.setTimeout(() => controller.abort(), resolvedTimeoutMs);
 
   try {
     const response = await fetch(`${API_BASE_URL}/artifacts/upload`, {
@@ -323,6 +536,8 @@ export async function uploadArtifact(file: File): Promise<ArtifactUploadResponse
     }
     throw new Error("Unable to upload artifact.");
   } finally {
-    window.clearTimeout(timeoutId);
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
   }
 }

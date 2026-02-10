@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import ChatPage from "./ChatPage";
+import BuilderPage from "./BuilderPage";
 import InspectPage from "./InspectPage";
 import ModelsPage from "./ModelsPage";
 import ToolPage from "../components/tool_page";
@@ -7,13 +8,29 @@ import WorkflowPage from "../components/workflow_page";
 import Monitor from "../components/monitor";
 import LeftNav from "../components/left_nav";
 
-type Page = "chat" | "models" | "tools" | "workflows" | "inspect";
+type Page = "chat" | "models" | "tools" | "builder" | "workflows" | "inspect";
 
 export default function Dashboard() {
   const [page, setPage] = useState<Page>("chat");
   const [selectedInspectRunId, setSelectedInspectRunId] = useState<string | null>(
     null
   );
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const customEvent = event as CustomEvent<{ page?: Page }>;
+      const targetPage = customEvent.detail?.page;
+      if (!targetPage) {
+        return;
+      }
+      setPage(targetPage);
+    };
+
+    window.addEventListener("dashboard:navigate", handler);
+    return () => {
+      window.removeEventListener("dashboard:navigate", handler);
+    };
+  }, []);
 
   return (
     <div>
@@ -29,6 +46,8 @@ export default function Dashboard() {
         <ModelsPage />
       ) : page === "tools" ? (
         <ToolPage />
+      ) : page === "builder" ? (
+        <BuilderPage />
       ) : page === "workflows" ? (
         <WorkflowPage />
       ) : page === "inspect" ? (
