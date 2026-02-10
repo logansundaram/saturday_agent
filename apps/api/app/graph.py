@@ -32,7 +32,7 @@ _VISION_REGISTRY = VisionModelRegistry(
         or os.getenv("VISION_DEFAULT_MODEL")
         or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
     ),
-    timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT", "30")),
+    timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT", "0")),
     allowlist_raw=os.getenv("VISION_MODEL_ALLOWLIST", ""),
 )
 

@@ -1,7 +1,8 @@
 export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
-const REQUEST_TIMEOUT_MS = 10000;
+// 0 disables client-side timeout (temporary global default for local runs).
+const REQUEST_TIMEOUT_MS = 0;
 // 0 disables client-side timeout for long-running chat/workflow runs.
 const chatTimeoutMsRaw = Number(import.meta.env.VITE_CHAT_TIMEOUT_MS ?? "0");
 const CHAT_REQUEST_TIMEOUT_MS = Number.isFinite(chatTimeoutMsRaw)
@@ -13,6 +14,9 @@ function resolveTimeout(
   fallbackMs: number = REQUEST_TIMEOUT_MS
 ): number | null {
   if (!Number.isFinite(timeoutMs)) {
+    if (!Number.isFinite(fallbackMs) || fallbackMs <= 0) {
+      return null;
+    }
     return fallbackMs;
   }
   if (timeoutMs <= 0) {

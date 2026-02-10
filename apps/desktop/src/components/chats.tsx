@@ -1,6 +1,8 @@
 import Chattile from "./chat_tile";
 import { useState } from "react";
 
+
+//deprecated
 export default function Chats(){
     const [open, setOpen] = useState(false);
     return(

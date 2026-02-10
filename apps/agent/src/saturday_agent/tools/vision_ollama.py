@@ -39,6 +39,17 @@ VISION_ANALYZE_OUTPUT_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _resolve_httpx_timeout(timeout_seconds: float) -> float | None:
+    try:
+        timeout_value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+
+    if timeout_value <= 0:
+        return None
+    return timeout_value
+
+
 def _resolve_db_path() -> Path:
     repo_root = Path(__file__).resolve().parents[5]
     env_value = os.getenv("SATURDAY_DB_PATH")
@@ -141,7 +152,10 @@ def _analyze_single_artifact(
     }
 
     try:
-        with httpx.Client(base_url=base_url, timeout=timeout_seconds) as client:
+        with httpx.Client(
+            base_url=base_url,
+            timeout=_resolve_httpx_timeout(timeout_seconds),
+        ) as client:
             response = client.post("/api/chat", json=payload)
     except httpx.HTTPError as exc:
         return _make_error(
@@ -227,7 +241,7 @@ def analyze_image_ollama(tool_input: Dict[str, Any]) -> Dict[str, Any]:
         prompt_text = f"{prompt}\n\nRespond concisely."
 
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    timeout_seconds = float(os.getenv("OLLAMA_TIMEOUT", "60"))
+    timeout_seconds = float(os.getenv("OLLAMA_TIMEOUT", "0"))
     registry = VisionModelRegistry(
         base_url=base_url,
         default_model=(

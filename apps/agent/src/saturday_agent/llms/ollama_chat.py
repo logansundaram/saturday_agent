@@ -5,6 +5,17 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 
+def _resolve_httpx_timeout(timeout_seconds: float) -> Optional[float]:
+    try:
+        timeout_value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+
+    if timeout_value <= 0:
+        return None
+    return timeout_value
+
+
 def ollama_chat(
     *,
     messages: List[Dict[str, Any]],
@@ -21,7 +32,10 @@ def ollama_chat(
     if options:
         payload["options"] = options
 
-    with httpx.Client(base_url=base_url, timeout=timeout_seconds) as client:
+    with httpx.Client(
+        base_url=base_url,
+        timeout=_resolve_httpx_timeout(timeout_seconds),
+    ) as client:
         response = client.post("/api/chat", json=payload)
         response.raise_for_status()
         return response.json()

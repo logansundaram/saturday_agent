@@ -5,6 +5,17 @@ from typing import Any, Dict, List
 import httpx
 
 
+def _resolve_httpx_timeout(timeout_seconds: float) -> float | None:
+    try:
+        timeout_value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+
+    if timeout_value <= 0:
+        return None
+    return timeout_value
+
+
 class ModelRegistry:
     """Stub model registry for future model management UI."""
 
@@ -15,7 +26,10 @@ class ModelRegistry:
 
     def _fetch_ollama_tags(self) -> tuple[Dict[str, Any], bool]:
         try:
-            with httpx.Client(base_url=self._base_url, timeout=self._timeout_seconds) as client:
+            with httpx.Client(
+                base_url=self._base_url,
+                timeout=_resolve_httpx_timeout(self._timeout_seconds),
+            ) as client:
                 response = client.get("/api/tags")
                 response.raise_for_status()
                 return response.json(), True

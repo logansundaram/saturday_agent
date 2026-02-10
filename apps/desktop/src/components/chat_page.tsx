@@ -10,7 +10,7 @@ export default function ChatPage(){
                 </p>
             </div>
 
-            <form className="fixed bottom-0 left-[12.5rem] right-[12.5rem] pb-6">
+            <form className="fixed bottom-0 left-[12.5rem] right-0 pb-6">
                 <div className="mx-auto max-w-3xl">
                     <div className="flex items-end gap-3 rounded-2xl border border-subtle bg-[#0b0b10]/90 px-4 py-3 shadow-[0_10px_30px_rgba(0,0,0,0.35)] ring-1 ring-white/10 focus-within:ring-2 focus-within:ring-[#6d28d9]/40 transition">
                         <textarea

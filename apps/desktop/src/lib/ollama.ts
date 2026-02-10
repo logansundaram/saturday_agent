@@ -1,7 +1,8 @@
 // TODO: Swap implementation to FastAPI/LangChain later (single choke point).
 
 const DEFAULT_BASE_URL = "http://localhost:11434";
-const DEFAULT_TIMEOUT_MS = 3000;
+// 0 disables client-side timeout.
+const DEFAULT_TIMEOUT_MS = 0;
 
 export type OllamaModel = {
   name: string;
@@ -64,12 +65,20 @@ async function fetchWithTimeout(
   options: RequestInit = {},
   timeoutMs: number = DEFAULT_TIMEOUT_MS
 ): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  const hasTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0;
+  const controller = hasTimeout ? new AbortController() : null;
+  const timeoutId = hasTimeout
+    ? globalThis.setTimeout(() => controller?.abort(), timeoutMs)
+    : null;
 
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, {
+      ...options,
+      signal: controller?.signal,
+    });
   } finally {
-    globalThis.clearTimeout(timeoutId);
+    if (timeoutId !== null) {
+      globalThis.clearTimeout(timeoutId);
+    }
   }
 }

@@ -746,9 +746,20 @@ def _resolve_db_path() -> Path:
     return repo_root / "apps/api/saturday.db"
 
 
+def _resolve_httpx_timeout(timeout_seconds: float) -> float | None:
+    try:
+        timeout_value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+
+    if timeout_value <= 0:
+        return None
+    return timeout_value
+
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL_DEFAULT = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "30"))
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "0"))
 DB_PATH = _resolve_db_path()
 
 app = FastAPI(title="Saturday API")
@@ -814,7 +825,7 @@ async def health() -> HealthResponse:
     ollama_status: Literal["ok", "down"] = "down"
     try:
         async with httpx.AsyncClient(
-            base_url=OLLAMA_BASE_URL, timeout=OLLAMA_TIMEOUT
+            base_url=OLLAMA_BASE_URL, timeout=_resolve_httpx_timeout(OLLAMA_TIMEOUT)
         ) as client:
             resp = await client.get("/api/tags")
         if resp.status_code == 200:
