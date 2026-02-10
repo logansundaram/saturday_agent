@@ -75,7 +75,16 @@ class ModelRegistry:
             "ollama_status": ollama_status,
         }
 
+    def list_text_models(self) -> List[Dict[str, Any]]:
+        return self.list_models()
+
+    def list_text_models_payload(self) -> Dict[str, Any]:
+        return self.list_models_payload()
+
     def get_default_model(self) -> str:
+        return self._default_model
+
+    def default_text_model(self) -> str:
         return self._default_model
 
     def set_default_model(self, model: str) -> None:

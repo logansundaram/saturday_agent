@@ -1,14 +1,9 @@
-import './App.css'
+import "./App.css";
 
-
-import Dashboard from './pages/dashboard'
+import Dashboard from "./pages/dashboard";
 
 function App() {
-  return (
-    <>
-      <Dashboard/>
-    </>
-  )
+  return <Dashboard />;
 }
 
-export default App
+export default App;

@@ -7,6 +7,13 @@ from saturday_agent.tools.search_tavily import (
     SEARCH_OUTPUT_SCHEMA,
     search_web_tavily,
 )
+from saturday_agent.tools.vision_ollama import (
+    TOOL_DESCRIPTION as VISION_TOOL_DESCRIPTION,
+    TOOL_NAME as VISION_TOOL_NAME,
+    VISION_ANALYZE_INPUT_SCHEMA,
+    VISION_ANALYZE_OUTPUT_SCHEMA,
+    analyze_image_ollama,
+)
 
 ToolHandler = Callable[[Dict[str, Any]], Dict[str, Any]]
 
@@ -41,6 +48,16 @@ class ToolRegistry:
             input_schema=SEARCH_INPUT_SCHEMA,
             output_schema=SEARCH_OUTPUT_SCHEMA,
             handler=search_web_tavily,
+        )
+        self.register_tool(
+            tool_id="vision.analyze",
+            name=VISION_TOOL_NAME,
+            description=VISION_TOOL_DESCRIPTION,
+            kind="local",
+            enabled=True,
+            input_schema=VISION_ANALYZE_INPUT_SCHEMA,
+            output_schema=VISION_ANALYZE_OUTPUT_SCHEMA,
+            handler=analyze_image_ollama,
         )
 
     def register_tool(
@@ -112,28 +129,66 @@ class ToolRegistry:
         return True
 
     def decide_tools(self, *, task: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
-        _ = task
+        normalized_task = str(task or "").strip()
         selected = context.get("selected_tool_ids")
         if not isinstance(selected, list):
-            return []
+            selected = []
 
         selected_ids = {str(item).strip() for item in selected if str(item).strip()}
-        if not selected_ids:
-            return []
-
         planned_calls: List[Dict[str, Any]] = []
         tool_inputs = context.get("tool_inputs")
         tool_inputs_map = tool_inputs if isinstance(tool_inputs, dict) else {}
 
+        artifact_ids_raw = context.get("artifact_ids")
+        artifact_ids = (
+            [str(item).strip() for item in artifact_ids_raw if str(item).strip()]
+            if isinstance(artifact_ids_raw, list)
+            else []
+        )
+        vision_model_id = str(context.get("vision_model_id") or "").strip()
+        vision_prompt = str(context.get("vision_prompt") or normalized_task or "").strip()
+        vision_detail = str(context.get("vision_detail") or "").strip().lower()
+        per_vision_input = tool_inputs_map.get("vision.analyze")
+        per_vision_input_map = (
+            dict(per_vision_input) if isinstance(per_vision_input, dict) else {}
+        )
+        if not vision_prompt:
+            vision_prompt = "Analyze the attached image."
+
+        vision_tool = self.get_tool("vision.analyze")
+        vision_enabled = bool(vision_tool and vision_tool.get("enabled"))
+        if vision_enabled and artifact_ids and vision_model_id:
+            for artifact_id in artifact_ids:
+                call_input = dict(per_vision_input_map)
+                call_input["artifact_id"] = artifact_id
+                call_input["prompt"] = str(call_input.get("prompt") or vision_prompt)
+                call_input["vision_model_id"] = str(
+                    call_input.get("vision_model_id") or vision_model_id
+                )
+                if vision_detail in {"low", "high"} and "detail" not in call_input:
+                    call_input["detail"] = vision_detail
+
+                planned_calls.append(
+                    {
+                        "tool_id": "vision.analyze",
+                        "name": str(vision_tool.get("name") or "Vision Analyze"),
+                        "kind": str(vision_tool.get("kind") or "local"),
+                        "status": "planned",
+                        "input": call_input,
+                    }
+                )
+
         for tool in self.list_tools():
             tool_id = str(tool.get("id", ""))
+            if tool_id == "vision.analyze":
+                continue
             if tool_id in selected_ids and bool(tool.get("enabled", False)):
                 call_input = {}
                 raw_input = tool_inputs_map.get(tool_id)
                 if isinstance(raw_input, dict):
                     call_input = dict(raw_input)
                 if tool_id == "search.web" and not str(call_input.get("query", "")).strip():
-                    call_input["query"] = task
+                    call_input["query"] = normalized_task
 
                 planned_calls.append(
                     {

@@ -37,6 +37,8 @@ class WorkflowState(TypedDict):
     task: str
     context: Dict[str, Any]
     messages: List[Dict[str, str]]
+    artifact_ids: List[str]
+    vision_model_id: Optional[str]
     plan: Optional[str]
     answer: Optional[str]
     artifacts: Dict[str, Any]
@@ -70,6 +72,17 @@ def normalize_messages(raw_messages: Any) -> List[Dict[str, str]]:
     return normalized
 
 
+def normalize_string_list(raw_items: Any) -> List[str]:
+    if not isinstance(raw_items, list):
+        return []
+    normalized: List[str] = []
+    for item in raw_items:
+        value = str(item).strip()
+        if value:
+            normalized.append(value)
+    return normalized
+
+
 def build_initial_state(
     *,
     task: str,
@@ -79,10 +92,20 @@ def build_initial_state(
     options: Optional[Dict[str, Any]] = None,
     default_model: Optional[str] = None,
 ) -> WorkflowState:
+    context_map = dict(context or {})
+    options_map = dict(options or {})
+    artifact_ids = normalize_string_list(context_map.get("artifact_ids"))
+    raw_vision_model = context_map.get("vision_model_id")
+    if raw_vision_model is None:
+        raw_vision_model = options_map.get("vision_model_id")
+    vision_model_id = str(raw_vision_model).strip() if raw_vision_model else None
+
     return WorkflowState(
         task=str(task or ""),
-        context=dict(context or {}),
+        context=context_map,
         messages=normalize_messages(messages or []),
+        artifact_ids=artifact_ids,
+        vision_model_id=vision_model_id,
         plan=None,
         answer=None,
         artifacts={},
@@ -93,7 +116,7 @@ def build_initial_state(
         verify_notes=None,
         retry_count=0,
         model=str(model) if model else default_model,
-        options=dict(options or {}),
+        options=options_map,
     )
 
 

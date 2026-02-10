@@ -45,6 +45,29 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS state_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                step_index INTEGER,
+                timestamp TEXT,
+                state_json TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                path TEXT,
+                mime TEXT,
+                size INTEGER,
+                sha256 TEXT,
+                created_at TEXT
+            )
+            """
+        )
         conn.commit()
 
 
@@ -134,6 +157,65 @@ def list_steps(run_id: str) -> list[dict]:
             (run_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def read_run(run_id: str) -> Optional[dict]:
+    return get_run(run_id)
+
+
+def read_steps(run_id: str) -> list[dict]:
+    return list_steps(run_id)
+
+
+def read_state_snapshots(run_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, run_id, step_index, timestamp, state_json
+            FROM state_snapshots
+            WHERE run_id = ?
+            ORDER BY step_index ASC, id ASC
+            """,
+            (run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def add_artifact(
+    *,
+    artifact_id: str,
+    path: str,
+    mime: str,
+    size: int,
+    sha256: str,
+    created_at: str,
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO artifacts (
+                artifact_id, path, mime, size, sha256, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (artifact_id, path, mime, int(size), sha256, created_at),
+        )
+        conn.commit()
+
+
+def read_artifact(artifact_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT artifact_id, path, mime, size, sha256, created_at
+            FROM artifacts
+            WHERE artifact_id = ?
+            """,
+            (artifact_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
 
 
 def _connect() -> sqlite3.Connection:
