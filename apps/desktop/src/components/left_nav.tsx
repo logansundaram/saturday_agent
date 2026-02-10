@@ -31,9 +31,6 @@ export default function LeftNav({page, onNavigate} : LeftNavProps){
                     Inspect
                 </p>
             </div>
-
-
-            <Chats/>
         </div>
     )
 }
