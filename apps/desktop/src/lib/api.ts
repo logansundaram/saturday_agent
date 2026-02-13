@@ -1,3 +1,5 @@
+import { streamSSE } from "./sse";
+
 export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
@@ -179,6 +181,7 @@ export type ChatRunRequest = {
   artifact_ids?: string[];
   context?: any;
   thread_id?: string;
+  stream?: boolean;
 };
 
 export type ChatRunStep = {
@@ -186,6 +189,7 @@ export type ChatRunStep = {
   status: "ok" | "error";
   started_at: string;
   ended_at: string;
+  summary?: string;
 };
 
 export type ChatRunResponse = {
@@ -196,6 +200,97 @@ export type ChatRunResponse = {
   model_id: string;
   tool_ids: string[];
 };
+
+export type StreamStepStatus = "running" | "ok" | "error";
+
+export type ChatRunTimelineStep = {
+  step_index: number;
+  name: string;
+  label?: string;
+  status: StreamStepStatus;
+  started_at?: string;
+  ended_at?: string;
+  summary?: string;
+  duration_ms?: number;
+};
+
+export type ChatRunStreamRunStartEvent = {
+  type: "run_start";
+  run_id: string;
+  workflow_id: string;
+  model_id: string;
+  tool_ids: string[];
+  started_at: string;
+};
+
+export type ChatRunStreamStepStartEvent = {
+  type: "step_start";
+  run_id: string;
+  step_index: number;
+  name: string;
+  started_at: string;
+  label?: string;
+};
+
+export type ChatRunStreamStepEndEvent = {
+  type: "step_end";
+  run_id: string;
+  step_index: number;
+  name: string;
+  status: "ok" | "error";
+  ended_at: string;
+  summary: string;
+  meta?: Record<string, any>;
+};
+
+export type ChatRunStreamToolCallEvent = {
+  type: "tool_call";
+  run_id: string;
+  step_index: number;
+  tool_id: string;
+  input_summary?: string;
+  input?: Record<string, any>;
+};
+
+export type ChatRunStreamToolResultEvent = {
+  type: "tool_result";
+  run_id: string;
+  step_index: number;
+  tool_id: string;
+  status: "ok" | "error";
+  output_summary?: string;
+  output?: Record<string, any>;
+};
+
+export type ChatRunStreamTokenEvent = {
+  type: "token";
+  run_id: string;
+  text: string;
+};
+
+export type ChatRunStreamFinalEvent = {
+  type: "final";
+  run_id: string;
+  status: "ok" | "error";
+  output_text: string;
+  ended_at: string;
+};
+
+export type ChatRunStreamErrorEvent = {
+  type: "error";
+  run_id: string;
+  message: string;
+};
+
+export type ChatRunStreamEvent =
+  | ChatRunStreamRunStartEvent
+  | ChatRunStreamStepStartEvent
+  | ChatRunStreamStepEndEvent
+  | ChatRunStreamToolCallEvent
+  | ChatRunStreamToolResultEvent
+  | ChatRunStreamTokenEvent
+  | ChatRunStreamFinalEvent
+  | ChatRunStreamErrorEvent;
 
 export type WorkflowRunRequest = {
   workflow_id: string;
@@ -231,6 +326,7 @@ export type Step = {
   status: "ok" | "error";
   started_at?: string;
   ended_at?: string;
+  summary?: string;
   input?: any;
   output?: any;
   error?: any;
@@ -463,6 +559,25 @@ export async function chatRun(req: ChatRunRequest): Promise<ChatRunResponse> {
       body: JSON.stringify(req),
     },
     CHAT_REQUEST_TIMEOUT_MS
+  );
+}
+
+export async function chatRunStream(
+  req: ChatRunRequest,
+  onEvent: (event: ChatRunStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  await streamSSE<ChatRunStreamEvent>(
+    `${API_BASE_URL}/chat/stream`,
+    { ...req, stream: true },
+    onEvent,
+    {
+      signal,
+      timeoutMs: CHAT_REQUEST_TIMEOUT_MS,
+      headers: {
+        Accept: "text/event-stream",
+      },
+    }
   );
 }
 

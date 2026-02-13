@@ -3,20 +3,27 @@ import AttachmentsBar, {
   type ChatAttachment,
 } from "../components/chat/AttachmentsBar";
 import DropzoneOverlay from "../components/chat/DropzoneOverlay";
+import StepsTimeline from "../components/chat/StepsTimeline";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Textarea } from "../components/ui/textarea";
 import {
   API_BASE_URL,
-  chatRun,
+  chatRunStream,
   getModels,
   getTools,
   getVisionModels,
   getWorkflows,
   uploadArtifact,
 } from "../lib/api";
-import type { Model, Tool, Workflow } from "../lib/api";
+import type {
+  ChatRunStreamEvent,
+  ChatRunTimelineStep,
+  Model,
+  Tool,
+  Workflow,
+} from "../lib/api";
 import {
   NEW_CHAT_TITLE,
   appendMessage,
@@ -29,6 +36,11 @@ import {
   type ChatStoreState,
   type ChatThread,
 } from "../lib/chatStore";
+import {
+  loadChatRunMetaMap,
+  setChatRunMeta,
+  type ChatRunMetaMap,
+} from "../lib/chatRunMetaStore";
 
 const MAX_TEXTAREA_HEIGHT = 160;
 const VISION_TOOL_ID = "vision.analyze";
@@ -100,14 +112,68 @@ const deriveThreadTitle = (text: string): string => {
   return clean.length > 48 ? `${clean.slice(0, 48)}...` : clean;
 };
 
+const ANSWER_STEP_NAMES = new Set(["llm_answer", "llm_execute", "llm_synthesize"]);
+
+type PendingAssistantMessage = {
+  messageId: string;
+  threadId: string;
+  content: string;
+  runId?: string;
+  status: "running" | "ok" | "error";
+  endedAt?: string;
+  workflowId?: string;
+  modelId?: string;
+  toolIds?: string[];
+  artifactIds?: string[];
+  steps: ChatRunTimelineStep[];
+  answerAttemptCount: number;
+};
+
+const sortTimelineSteps = (steps: ChatRunTimelineStep[]): ChatRunTimelineStep[] =>
+  [...steps].sort((left, right) => left.step_index - right.step_index);
+
+const stepDurationMs = (startedAt?: string, endedAt?: string): number | undefined => {
+  if (!startedAt || !endedAt) {
+    return undefined;
+  }
+  const started = Date.parse(startedAt);
+  const ended = Date.parse(endedAt);
+  if (!Number.isFinite(started) || !Number.isFinite(ended)) {
+    return undefined;
+  }
+  return Math.max(0, ended - started);
+};
+
+const upsertTimelineStep = (
+  steps: ChatRunTimelineStep[],
+  next: ChatRunTimelineStep
+): ChatRunTimelineStep[] => {
+  const existingIndex = steps.findIndex((step) => step.step_index === next.step_index);
+  if (existingIndex < 0) {
+    return sortTimelineSteps([...steps, next]);
+  }
+  const merged = [...steps];
+  merged[existingIndex] = {
+    ...merged[existingIndex],
+    ...next,
+  };
+  return sortTimelineSteps(merged);
+};
+
 type ChatPageProps = {
   onInspectRun?: (runId: string) => void;
 };
 
 export default function ChatPage({ onInspectRun }: ChatPageProps) {
   const [chatState, setChatState] = useState<ChatStoreState>(() => loadState());
+  const [runMetaByMessageId, setRunMetaByMessageId] = useState<ChatRunMetaMap>(() =>
+    loadChatRunMetaMap()
+  );
   const [input, setInput] = useState<string>("");
   const [isSending, setIsSending] = useState<boolean>(false);
+  const [streamingAssistant, setStreamingAssistant] = useState<PendingAssistantMessage | null>(
+    null
+  );
   const [autoScroll, setAutoScroll] = useState<boolean>(true);
 
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
@@ -193,7 +259,7 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
     if (container) {
       container.scrollTop = container.scrollHeight;
     }
-  }, [activeMessages, autoScroll, isSending]);
+  }, [activeMessages, autoScroll, isSending, streamingAssistant]);
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -679,8 +745,143 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
       fileInputRef.current.value = "";
     }
 
+    const assistantMessageId = createId();
+    const pending: PendingAssistantMessage = {
+      messageId: assistantMessageId,
+      threadId: activeThreadId,
+      content: "",
+      runId: undefined,
+      status: "running",
+      endedAt: undefined,
+      workflowId: selectedWorkflowId || undefined,
+      modelId: selectedModelId || undefined,
+      toolIds: [...selectedToolIds],
+      artifactIds: [...attachmentIds],
+      steps: [],
+      answerAttemptCount: 0,
+    };
+    setStreamingAssistant({ ...pending, steps: [] });
+
+    const publishPending = () => {
+      setStreamingAssistant({
+        ...pending,
+        steps: [...pending.steps],
+        toolIds: pending.toolIds ? [...pending.toolIds] : undefined,
+        artifactIds: pending.artifactIds ? [...pending.artifactIds] : undefined,
+      });
+    };
+
+    let finalReceived = false;
+    let streamErrorMessage = "";
+
+    const handleStreamEvent = (event: ChatRunStreamEvent) => {
+      if (pending.runId && event.run_id && event.run_id !== pending.runId) {
+        return;
+      }
+
+      switch (event.type) {
+        case "run_start": {
+          pending.runId = event.run_id;
+          pending.workflowId = event.workflow_id || pending.workflowId;
+          pending.modelId = event.model_id || pending.modelId;
+          pending.toolIds = Array.isArray(event.tool_ids)
+            ? event.tool_ids
+            : pending.toolIds;
+          break;
+        }
+        case "step_start": {
+          if (ANSWER_STEP_NAMES.has(event.name)) {
+            pending.answerAttemptCount += 1;
+            pending.content = "";
+          }
+          pending.steps = upsertTimelineStep(pending.steps, {
+            step_index: event.step_index,
+            name: event.name,
+            label: event.label || event.name.replace(/_/g, " "),
+            status: "running",
+            started_at: event.started_at,
+          });
+          break;
+        }
+        case "step_end": {
+          const existing = pending.steps.find(
+            (step) => step.step_index === event.step_index
+          );
+          const labelFromMeta =
+            event.meta && typeof event.meta.label === "string"
+              ? event.meta.label
+              : undefined;
+          pending.steps = upsertTimelineStep(pending.steps, {
+            step_index: event.step_index,
+            name: event.name,
+            label: labelFromMeta || existing?.label || event.name.replace(/_/g, " "),
+            status: event.status,
+            started_at: existing?.started_at,
+            ended_at: event.ended_at,
+            summary: event.summary,
+            duration_ms: stepDurationMs(existing?.started_at, event.ended_at),
+          });
+          break;
+        }
+        case "tool_call": {
+          const existing = pending.steps.find(
+            (step) => step.step_index === event.step_index
+          );
+          pending.steps = upsertTimelineStep(pending.steps, {
+            step_index: event.step_index,
+            name: existing?.name || `tool.${event.tool_id}`,
+            label: existing?.label || `tool ${event.tool_id}`,
+            status: existing?.status || "running",
+            started_at: existing?.started_at,
+            ended_at: existing?.ended_at,
+            summary: event.input_summary || existing?.summary,
+            duration_ms: existing?.duration_ms,
+          });
+          break;
+        }
+        case "tool_result": {
+          const existing = pending.steps.find(
+            (step) => step.step_index === event.step_index
+          );
+          pending.steps = upsertTimelineStep(pending.steps, {
+            step_index: event.step_index,
+            name: existing?.name || `tool.${event.tool_id}`,
+            label: existing?.label || `tool ${event.tool_id}`,
+            status: event.status,
+            started_at: existing?.started_at,
+            ended_at: existing?.ended_at,
+            summary: event.output_summary || existing?.summary,
+            duration_ms: existing?.duration_ms,
+          });
+          break;
+        }
+        case "token": {
+          pending.content = `${pending.content}${event.text ?? ""}`;
+          break;
+        }
+        case "error": {
+          streamErrorMessage = event.message || "Workflow execution failed.";
+          break;
+        }
+        case "final": {
+          finalReceived = true;
+          pending.runId = pending.runId || event.run_id;
+          pending.status = event.status;
+          pending.endedAt = event.ended_at;
+          pending.content = event.output_text || pending.content;
+          if (!pending.content && streamErrorMessage && event.status === "error") {
+            pending.content = `Error: ${streamErrorMessage}`;
+          }
+          break;
+        }
+      }
+
+      publishPending();
+    };
+
     try {
-      const result = await chatRun({
+      await chatRunStream(
+        {
         message: messageToSend,
         thread_id: activeThreadId,
         workflow_id: selectedWorkflowId,
@@ -688,31 +889,82 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
         tool_ids: selectedToolIds,
         vision_model_id: selectedVision || undefined,
         artifact_ids: attachmentIds,
-      });
+      },
+        handleStreamEvent
+      );
+
+      if (!finalReceived) {
+        throw new Error(streamErrorMessage || "Stream ended before final response.");
+      }
+
+      const assistantContent =
+        pending.status === "error" &&
+        pending.content &&
+        !pending.content.trim().toLowerCase().startsWith("error:")
+          ? `Error: ${pending.content}`
+          : pending.content || "";
+
       appendMessage(activeThreadId, {
-        id: createId(),
+        id: assistantMessageId,
         role: "assistant",
-        content: result.output_text || "",
+        content: assistantContent,
         createdAt: Date.now(),
-        runId: result.run_id,
-        workflowId: result.workflow_id || selectedWorkflowId || undefined,
-        modelId: result.model_id || selectedModelId || undefined,
-        toolIds: Array.isArray(result.tool_ids) ? result.tool_ids : selectedToolIds,
-        artifactIds: attachmentIds,
+        runId: pending.runId,
+        workflowId: pending.workflowId,
+        modelId: pending.modelId,
+        toolIds: pending.toolIds,
+        artifactIds: pending.artifactIds,
       });
+
+      const nextMeta = setChatRunMeta(assistantMessageId, {
+        runId: pending.runId,
+        status: pending.status === "error" ? "error" : "ok",
+        endedAt: pending.endedAt,
+        steps: pending.steps,
+        workflowId: pending.workflowId,
+        modelId: pending.modelId,
+        toolIds: pending.toolIds,
+      });
+      setRunMetaByMessageId(nextMeta);
+
+      setStreamingAssistant((current) =>
+        current && current.messageId === assistantMessageId ? null : current
+      );
     } catch (error) {
       const detail =
         error instanceof Error ? error.message : "Failed to reach backend";
+      setStreamingAssistant((current) =>
+        current && current.messageId === assistantMessageId ? null : current
+      );
+      const fallbackParts: string[] = [];
+      if (pending.content.trim()) {
+        fallbackParts.push(pending.content.trim());
+      }
+      fallbackParts.push(`Error: ${detail}`);
+      const fallbackContent = fallbackParts.join("\n\n");
       appendMessage(activeThreadId, {
         id: createId(),
         role: "assistant",
-        content: `Error: ${detail}`,
+        content: fallbackContent,
         createdAt: Date.now(),
-        workflowId: selectedWorkflowId || undefined,
-        modelId: selectedModelId || undefined,
-        toolIds: selectedToolIds,
-        artifactIds: attachmentIds,
+        runId: pending.runId,
+        workflowId: pending.workflowId || selectedWorkflowId || undefined,
+        modelId: pending.modelId || selectedModelId || undefined,
+        toolIds: pending.toolIds || selectedToolIds,
+        artifactIds: pending.artifactIds || attachmentIds,
       });
+      if (pending.runId || pending.steps.length > 0) {
+        const nextMeta = setChatRunMeta(assistantMessageId, {
+          runId: pending.runId,
+          status: "error",
+          endedAt: pending.endedAt,
+          steps: pending.steps,
+          workflowId: pending.workflowId,
+          modelId: pending.modelId,
+          toolIds: pending.toolIds,
+        });
+        setRunMetaByMessageId(nextMeta);
+      }
     } finally {
       refreshChatState();
       setIsSending(false);
@@ -723,6 +975,7 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
     chatState.activeThreadId,
     chatState.messagesByThread,
     activeThread,
+    setRunMetaByMessageId,
     isSending,
     isUploadingArtifacts,
     backendReady,
@@ -1106,6 +1359,15 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
                   const isError =
                     message.role === "assistant" &&
                     message.content.trim().toLowerCase().startsWith("error:");
+                  const persistedMeta =
+                    message.role === "assistant"
+                      ? runMetaByMessageId[message.id]
+                      : undefined;
+                  const displayRunId =
+                    typeof message.runId === "string" && message.runId.trim()
+                      ? message.runId
+                      : persistedMeta?.runId;
+                  const timelineSteps = persistedMeta?.steps ?? [];
 
                   return (
                     <div
@@ -1113,6 +1375,9 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
                       className={`flex ${isUser ? "justify-end" : "justify-start"}`}
                     >
                       <div className="max-w-[75%]">
+                        {!isUser && timelineSteps.length > 0 ? (
+                          <StepsTimeline steps={timelineSteps} />
+                        ) : null}
                         <div
                           className={
                             `rounded-2xl border px-4 py-3 text-sm leading-relaxed shadow-sm ` +
@@ -1127,24 +1392,24 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
                         </div>
 
                         {!isUser &&
-                        (message.runId ||
+                        (displayRunId ||
                           message.workflowId ||
                           message.modelId ||
                           (message.toolIds?.length ?? 0) > 0) ? (
                           <div className="mt-1 flex items-center justify-between gap-3 text-[11px] text-secondary">
                             <span className="truncate">
-                              {message.runId ? `Run ID: ${message.runId}` : "Assistant reply"}
+                              {displayRunId ? `Run ID: ${displayRunId}` : "Assistant reply"}
                               {message.workflowId ? ` · ${message.workflowId}` : ""}
                               {message.modelId ? ` · ${message.modelId}` : ""}
                               {message.toolIds && message.toolIds.length > 0
                                 ? ` · ${message.toolIds.length} tools`
                                 : ""}
                             </span>
-                            {message.runId ? (
+                            {displayRunId ? (
                               <Button
                                 type="button"
                                 className="h-6 rounded-full border border-subtle bg-transparent px-2.5 text-[11px] text-secondary hover:text-primary"
-                                onClick={() => openInspect(message.runId)}
+                                onClick={() => openInspect(displayRunId)}
                               >
                                 Inspect
                               </Button>
@@ -1157,10 +1422,44 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
                 })
               )}
 
-              {isSending ? (
+              {streamingAssistant &&
+              streamingAssistant.threadId === chatState.activeThreadId ? (
                 <div className="flex justify-start">
-                  <div className="max-w-[75%] rounded-2xl border border-subtle bg-[#0b0b10] px-4 py-3 text-sm text-secondary">
-                    Thinking...
+                  <div className="max-w-[75%]">
+                    {streamingAssistant.steps.length > 0 ? (
+                      <StepsTimeline steps={streamingAssistant.steps} />
+                    ) : null}
+                    <div className="rounded-2xl border border-subtle bg-[#0b0b10] px-4 py-3 text-sm leading-relaxed shadow-sm">
+                      <p className="whitespace-pre-wrap text-primary">
+                        {streamingAssistant.content || "Streaming response..."}
+                      </p>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between gap-3 text-[11px] text-secondary">
+                      <span className="truncate">
+                        {streamingAssistant.runId
+                          ? `Run ID: ${streamingAssistant.runId}`
+                          : "Assistant reply"}
+                        {streamingAssistant.workflowId
+                          ? ` · ${streamingAssistant.workflowId}`
+                          : ""}
+                        {streamingAssistant.modelId
+                          ? ` · ${streamingAssistant.modelId}`
+                          : ""}
+                        {streamingAssistant.toolIds &&
+                        streamingAssistant.toolIds.length > 0
+                          ? ` · ${streamingAssistant.toolIds.length} tools`
+                          : ""}
+                      </span>
+                      {streamingAssistant.runId ? (
+                        <Button
+                          type="button"
+                          className="h-6 rounded-full border border-subtle bg-transparent px-2.5 text-[11px] text-secondary hover:text-primary"
+                          onClick={() => openInspect(streamingAssistant.runId)}
+                        >
+                          Inspect
+                        </Button>
+                      ) : null}
+                    </div>
                   </div>
                 </div>
               ) : null}

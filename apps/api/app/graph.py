@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from app import db
 
@@ -122,12 +123,174 @@ def _runtime_registry(
     )
 
 
+def _clip_summary(value: str, *, limit: int = 140) -> str:
+    normalized = " ".join(str(value or "").split()).strip()
+    if not normalized:
+        return "Completed step."
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _first_line(value: Any) -> str:
+    text = ""
+    if isinstance(value, dict):
+        text = str(value.get("message") or value.get("error") or "")
+    else:
+        text = str(value or "")
+    return text.splitlines()[0].strip()
+
+
+def _step_label(name: str) -> str:
+    if name.startswith("tool."):
+        tool_id = name.replace("tool.", "", 1).strip()
+        return f"tool {tool_id}".strip()
+    if name.startswith("node."):
+        node_id = name.replace("node.", "", 1).strip()
+        return f"node {node_id}".strip()
+    return name.replace("_", " ").strip() or "step"
+
+
+def _count_plan_items(plan_text: str) -> int:
+    lines = [line.strip() for line in str(plan_text or "").splitlines() if line.strip()]
+    bullets = [
+        line
+        for line in lines
+        if re.match(r"^(\d+[.)]|[-*•])\s+", line)
+    ]
+    if bullets:
+        return len(bullets)
+    return len(lines)
+
+
+def _summary_for_step(
+    *,
+    name: str,
+    status: str,
+    input_data: Dict[str, Any],
+    output_data: Dict[str, Any],
+) -> str:
+    normalized_status = str(status or "ok").lower()
+    if normalized_status != "ok":
+        raw_error = (
+            output_data.get("error")
+            if isinstance(output_data, dict)
+            else None
+        )
+        if raw_error is None and isinstance(output_data, dict):
+            response = output_data.get("response")
+            if isinstance(response, dict):
+                raw_error = response.get("error")
+        error_text = _first_line(raw_error) or "step failed"
+        return _clip_summary(f"Failed in {_step_label(name)}: {error_text}")
+
+    if name == "plan":
+        plan_text = str(output_data.get("plan") or "")
+        item_count = _count_plan_items(plan_text)
+        return _clip_summary(f"Created a {item_count}-step plan.")
+
+    if name == "rag_retrieve":
+        retrieval = output_data.get("retrieval") if isinstance(output_data.get("retrieval"), dict) else {}
+        results = retrieval.get("results") if isinstance(retrieval.get("results"), list) else []
+        return _clip_summary(f"Retrieved {len(results)} relevant passages.")
+
+    if name == "decide_tools":
+        planned_calls = output_data.get("tool_calls") if isinstance(output_data.get("tool_calls"), list) else []
+        return _clip_summary(f"Selected {len(planned_calls)} tools to run.")
+
+    if name == "execute_tools":
+        results = output_data.get("tool_results") if isinstance(output_data.get("tool_results"), list) else []
+        ok_count = sum(
+            1
+            for item in results
+            if isinstance(item, dict) and str(item.get("status") or "ok").lower() == "ok"
+        )
+        if len(results) == 0:
+            return _clip_summary("No tools were executed.")
+        if ok_count == len(results):
+            return _clip_summary(f"Ran {ok_count} tools successfully.")
+        return _clip_summary(f"Ran {len(results)} tools with {len(results) - ok_count} errors.")
+
+    if name in {"llm_answer", "llm_execute", "llm_synthesize"}:
+        return _clip_summary("Generated response content.")
+
+    if name == "build_messages":
+        return _clip_summary("Prepared conversation messages.")
+
+    if name == "verify":
+        verify_ok = bool(output_data.get("verify_ok"))
+        return _clip_summary("Verification passed." if verify_ok else "Verification requested changes.")
+
+    if name == "repair":
+        retry_count = int(output_data.get("retry_count") or 0)
+        return _clip_summary(f"Updated plan for retry {retry_count}.")
+
+    if name == "finalize":
+        return _clip_summary("Prepared final response.")
+
+    if name == "ingest_input":
+        return _clip_summary("Captured request input.")
+
+    if name.startswith("tool."):
+        tool_id = str(
+            input_data.get("tool_id")
+            or output_data.get("tool_id")
+            or name.replace("tool.", "", 1)
+        ).strip()
+        response = output_data.get("response")
+        response_data = response if isinstance(response, dict) else {}
+        if tool_id == "rag.retrieve":
+            payload = response_data.get("data") if isinstance(response_data.get("data"), dict) else {}
+            results = payload.get("results") if isinstance(payload.get("results"), list) else []
+            return _clip_summary(f"Retrieved {len(results)} relevant passages.")
+        return _clip_summary(f"Ran {tool_id} successfully.")
+
+    return _clip_summary(f"Completed {_step_label(name)}.")
+
+
+def _tool_input_summary(tool_id: str, payload: Dict[str, Any]) -> str:
+    if tool_id == "rag.retrieve":
+        query = str(payload.get("query") or "").strip()
+        return _clip_summary(f"Retrieval query: {query or 'unspecified'}")
+    if tool_id == "vision.analyze":
+        artifact_id = str(payload.get("artifact_id") or "").strip()
+        if artifact_id:
+            return _clip_summary(f"Analyzing artifact {artifact_id}.")
+        return _clip_summary("Analyzing attached image input.")
+    query = str(payload.get("query") or "").strip()
+    if query:
+        return _clip_summary(f"Input query: {query}")
+    return _clip_summary(f"Running {tool_id} with {len(payload)} input fields.")
+
+
+def _tool_output_summary(tool_id: str, output_data: Dict[str, Any], status: str) -> str:
+    if str(status or "ok").lower() != "ok":
+        response = output_data.get("response")
+        error_text = _first_line(response if isinstance(response, dict) else output_data)
+        return _clip_summary(error_text or f"{tool_id} failed.")
+
+    response = output_data.get("response")
+    response_data = response if isinstance(response, dict) else {}
+    if tool_id == "rag.retrieve":
+        payload = response_data.get("data") if isinstance(response_data.get("data"), dict) else {}
+        results = payload.get("results") if isinstance(payload.get("results"), list) else []
+        return _clip_summary(f"Retrieved {len(results)} relevant passages.")
+    return _clip_summary(f"{tool_id} completed successfully.")
+
+
 class StepRecorder:
-    def __init__(self, run_id: str) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         self.run_id = run_id
         self.steps: List[Dict[str, Any]] = []
         self._step_index = 0
         self._node_events = 0
+        self._pending_steps: Dict[str, Dict[str, Any]] = {}
+        self._event_sink = event_sink
 
     @property
     def node_events(self) -> int:
@@ -137,19 +300,32 @@ class StepRecorder:
         started_at = _to_iso(_now_utc())
         ended_at = _to_iso(_now_utc())
         self._log(
+            step_index=self._step_index,
             name="ingest_input",
             status="ok",
             input_data=input_data,
             output_data={"workflow_id": workflow_id},
             started_at=started_at,
             ended_at=ended_at,
+            summary=_summary_for_step(
+                name="ingest_input",
+                status="ok",
+                input_data=input_data,
+                output_data={"workflow_id": workflow_id},
+            ),
+            label="ingest input",
         )
+        self._step_index += 1
 
     def emit(self, event: StepEvent) -> None:
         payload = _model_dump(event)
+        phase = str(payload.get("phase") or "end").lower()
         started_at = str(payload.get("started_at") or _to_iso(_now_utc()))
         ended_at = str(payload.get("ended_at") or _to_iso(_now_utc()))
         name = str(payload.get("name") or "node")
+        status = str(payload.get("status") or "ok")
+        label = str(payload.get("label") or _step_label(name))
+
         input_payload = payload.get("input") if isinstance(payload.get("input"), dict) else {}
         output_payload = payload.get("output") if isinstance(payload.get("output"), dict) else {}
 
@@ -158,7 +334,7 @@ class StepRecorder:
                 input_payload.get("tool_id")
                 or output_payload.get("tool_id")
                 or name.replace("tool.", "", 1)
-            )
+            ).strip()
             raw_tool_input = input_payload.get("payload")
             if not isinstance(raw_tool_input, dict):
                 maybe_input = input_payload.get("input")
@@ -176,60 +352,159 @@ class StepRecorder:
                 "response": raw_tool_output,
             }
 
+        key = f"{name}|{started_at}"
+        if phase == "start":
+            step_index = self._step_index
+            self._step_index += 1
+            self._pending_steps[key] = {
+                "step_index": step_index,
+                "label": label,
+                "name": name,
+                "started_at": started_at,
+                "input": input_payload,
+            }
+            if self._event_sink:
+                self._event_sink(
+                    {
+                        "type": "step_start",
+                        "run_id": self.run_id,
+                        "step_index": step_index,
+                        "name": name,
+                        "label": label,
+                        "started_at": started_at,
+                    }
+                )
+                if name.startswith("tool."):
+                    tool_id = str(input_payload.get("tool_id") or name.replace("tool.", "", 1))
+                    tool_input = (
+                        input_payload.get("payload")
+                        if isinstance(input_payload.get("payload"), dict)
+                        else {}
+                    )
+                    self._event_sink(
+                        {
+                            "type": "tool_call",
+                            "run_id": self.run_id,
+                            "step_index": step_index,
+                            "tool_id": tool_id,
+                            "input_summary": _tool_input_summary(tool_id, tool_input),
+                        }
+                    )
+            return
+
+        pending = self._pending_steps.pop(key, None)
+        if pending:
+            step_index = int(pending.get("step_index") or 0)
+            label = str(pending.get("label") or label)
+        else:
+            step_index = self._step_index
+            self._step_index += 1
+
+        summary = _summary_for_step(
+            name=name,
+            status=status,
+            input_data=input_payload if isinstance(input_payload, dict) else {},
+            output_data=output_payload if isinstance(output_payload, dict) else {},
+        )
+
         self._node_events += 1
         self._log(
+            step_index=step_index,
             name=name,
-            status=str(payload.get("status") or "ok"),
+            status=status,
             input_data=input_payload if isinstance(input_payload, dict) else {},
             output_data=output_payload if isinstance(output_payload, dict) else {},
             started_at=started_at,
             ended_at=ended_at,
+            summary=summary,
+            label=label,
         )
+
+        if self._event_sink:
+            self._event_sink(
+                {
+                    "type": "step_end",
+                    "run_id": self.run_id,
+                    "step_index": step_index,
+                    "name": name,
+                    "status": "ok" if status.lower() == "ok" else "error",
+                    "ended_at": ended_at,
+                    "summary": summary,
+                    "meta": {"label": label},
+                }
+            )
+            if name.startswith("tool."):
+                tool_id = str(output_payload.get("tool_id") or name.replace("tool.", "", 1))
+                self._event_sink(
+                    {
+                        "type": "tool_result",
+                        "run_id": self.run_id,
+                        "step_index": step_index,
+                        "tool_id": tool_id,
+                        "status": "ok" if status.lower() == "ok" else "error",
+                        "output_summary": _tool_output_summary(tool_id, output_payload, status),
+                    }
+                )
 
     def log_runtime_error(self, workflow_id: str, error: str) -> None:
         started_at = _to_iso(_now_utc())
         ended_at = _to_iso(_now_utc())
+        summary = _summary_for_step(
+            name="runtime_error",
+            status="error",
+            input_data={"workflow_id": workflow_id},
+            output_data={"error": error},
+        )
         self._log(
+            step_index=self._step_index,
             name="runtime_error",
             status="error",
             input_data={"workflow_id": workflow_id},
             output_data={"error": error},
             started_at=started_at,
             ended_at=ended_at,
+            summary=summary,
+            label="runtime error",
         )
+        self._step_index += 1
 
     def _log(
         self,
         *,
+        step_index: int,
         name: str,
         status: str,
         input_data: Dict[str, Any],
         output_data: Dict[str, Any],
         started_at: str,
         ended_at: str,
+        summary: str,
+        label: str,
     ) -> None:
         db.add_step(
             run_id=self.run_id,
-            step_index=self._step_index,
+            step_index=step_index,
             name=name,
             input_json=_json_dumps(input_data),
             output_json=_json_dumps(output_data),
+            summary=summary,
             status=status,
             started_at=started_at,
             ended_at=ended_at,
         )
         self.steps.append(
             {
-                "step_index": self._step_index,
+                "step_index": step_index,
                 "name": name,
+                "label": label,
                 "status": status,
                 "started_at": started_at,
                 "ended_at": ended_at,
+                "summary": summary,
                 "input": input_data,
                 "output": output_data,
             }
         )
-        self._step_index += 1
 
 
 def list_workflows() -> List[Dict[str, Any]]:
@@ -300,6 +575,18 @@ def invoke_tool(
     tool_output: Dict[str, Any] = {}
 
     step_started = _to_iso(_now_utc())
+    recorder.emit(
+        StepEvent(
+            name=f"tool.{tool_id}",
+            status="ok",
+            phase="start",
+            label=f"tool {tool_id}",
+            started_at=step_started,
+            ended_at=step_started,
+            input={"tool_id": tool_id, "input": dict(tool_input or {})},
+            output={},
+        )
+    )
     try:
         raw_output = runtime_registry.invoke_tool(
             tool_id=str(tool_id or ""),
@@ -324,6 +611,8 @@ def invoke_tool(
         StepEvent(
             name=f"tool.{tool_id}",
             status=status,
+            phase="end",
+            label=f"tool {tool_id}",
             started_at=step_started,
             ended_at=step_ended,
             input={"tool_id": tool_id, "input": dict(tool_input or {})},
@@ -378,16 +667,14 @@ def compile_workflow(
     )
 
 
-def run_workflow(
+def _execute_workflow_run(
+    *,
     workflow_id: str,
     input: Dict[str, Any],
-    *,
+    recorder: StepRecorder,
     tool_defs: Optional[List[Dict[str, Any]]] = None,
     workflow_defs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    run_id = str(uuid.uuid4())
-    started_at = _now_utc()
-
     db_tools = _normalize_tool_definitions(db.list_tools())
     db_workflows = _normalize_workflow_definitions(db.list_workflows())
     merged_tool_defs = _merge_definitions(
@@ -405,16 +692,6 @@ def run_workflow(
         tool_defs=merged_tool_defs,
         workflow_defs=merged_workflow_defs,
     )
-
-    db.create_run(
-        run_id,
-        "workflow_run",
-        _json_dumps({"workflow_id": workflow_id, "input": input}),
-        _to_iso(started_at),
-    )
-
-    recorder = StepRecorder(run_id)
-    recorder.log_ingest(input_data=input, workflow_id=workflow_id)
 
     status = "ok"
     workflow_type = ""
@@ -440,6 +717,43 @@ def run_workflow(
 
         if recorder.node_events == 0:
             recorder.log_runtime_error(workflow_id=workflow_id, error=str(exc))
+
+    return {
+        "status": status,
+        "workflow_type": workflow_type,
+        "output": output,
+    }
+
+
+def run_workflow(
+    workflow_id: str,
+    input: Dict[str, Any],
+    *,
+    tool_defs: Optional[List[Dict[str, Any]]] = None,
+    workflow_defs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    run_id = str(uuid.uuid4())
+    started_at = _now_utc()
+
+    db.create_run(
+        run_id,
+        "workflow_run",
+        _json_dumps({"workflow_id": workflow_id, "input": input}),
+        _to_iso(started_at),
+    )
+
+    recorder = StepRecorder(run_id)
+    recorder.log_ingest(input_data=input, workflow_id=workflow_id)
+    execution = _execute_workflow_run(
+        workflow_id=workflow_id,
+        input=input,
+        recorder=recorder,
+        tool_defs=tool_defs,
+        workflow_defs=workflow_defs,
+    )
+    status = str(execution.get("status") or "error")
+    workflow_type = str(execution.get("workflow_type") or "")
+    output = execution.get("output") if isinstance(execution.get("output"), dict) else {}
 
     ended_at = _now_utc()
     result_payload = {
@@ -472,9 +786,290 @@ def run_chat_workflow(
     context: Optional[Dict[str, Any]] = None,
     thread_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    prepared = _prepare_chat_execution(
+        workflow_id=workflow_id,
+        model_id=model_id,
+        tool_ids=tool_ids,
+        message=message,
+        vision_model_id=vision_model_id,
+        artifact_ids=artifact_ids,
+        context=context,
+        thread_id=thread_id,
+    )
+    if not bool(prepared.get("ok")):
+        return dict(prepared.get("response") or {})
+
+    workflow_input = dict(prepared.get("workflow_input") or {})
+    db_tool_defs = prepared.get("db_tool_defs")
+    db_workflow_defs = prepared.get("db_workflow_defs")
+    workflow_result = run_workflow(
+        workflow_id=workflow_id,
+        input=workflow_input,
+        tool_defs=db_tool_defs if isinstance(db_tool_defs, list) else None,
+        workflow_defs=db_workflow_defs if isinstance(db_workflow_defs, list) else None,
+    )
+    return _chat_response_from_workflow_result(
+        workflow_result=workflow_result,
+        workflow_id=workflow_id,
+        model_id=model_id,
+        resolved_tool_ids=list(prepared.get("resolved_tool_ids") or []),
+    )
+
+
+def run_chat_workflow_stream(
+    *,
+    workflow_id: str,
+    model_id: str,
+    tool_ids: List[str],
+    message: str,
+    emit_event: Callable[[Dict[str, Any]], None],
+    vision_model_id: Optional[str] = None,
+    artifact_ids: Optional[List[str]] = None,
+    context: Optional[Dict[str, Any]] = None,
+    thread_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    run_id = str(uuid.uuid4())
+    started_at = _to_iso(_now_utc())
+
+    base_payload = {
+        "workflow_id": workflow_id,
+        "model_id": model_id,
+        "tool_ids": list(tool_ids or []),
+        "message": message,
+        "vision_model_id": vision_model_id,
+        "artifact_ids": list(artifact_ids or []),
+        "context": dict(context or {}),
+        "thread_id": thread_id,
+        "stream": True,
+    }
+    db.create_run(
+        run_id,
+        "chat_stream",
+        _json_dumps(base_payload),
+        started_at,
+    )
+
+    requested_tool_ids = [str(item).strip() for item in tool_ids if str(item).strip()]
+
+    emit_event(
+        {
+            "type": "run_start",
+            "run_id": run_id,
+            "workflow_id": workflow_id,
+            "model_id": model_id,
+            "tool_ids": requested_tool_ids,
+            "started_at": started_at,
+        }
+    )
+    resolved_tool_ids = list(requested_tool_ids)
+    recorder: Optional[StepRecorder] = None
+
+    try:
+        token_emitter = lambda token: emit_event({"type": "token", "run_id": run_id, "text": str(token)})
+        prepared = _prepare_chat_execution(
+            workflow_id=workflow_id,
+            model_id=model_id,
+            tool_ids=tool_ids,
+            message=message,
+            vision_model_id=vision_model_id,
+            artifact_ids=artifact_ids,
+            context=context,
+            thread_id=thread_id,
+            token_emitter=token_emitter,
+        )
+        resolved_tool_ids = list(prepared.get("resolved_tool_ids") or requested_tool_ids)
+
+        if not bool(prepared.get("ok")):
+            response_payload = dict(prepared.get("response") or {})
+            error_text = str(response_payload.get("output_text") or "Workflow execution failed.")
+            ended_at = _to_iso(_now_utc())
+            emit_event({"type": "error", "run_id": run_id, "message": error_text})
+            emit_event(
+                {
+                    "type": "final",
+                    "run_id": run_id,
+                    "status": "error",
+                    "output_text": error_text,
+                    "ended_at": ended_at,
+                }
+            )
+            result_payload = {
+                "run_id": run_id,
+                "workflow_id": workflow_id,
+                "model_id": model_id,
+                "tool_ids": resolved_tool_ids,
+                "status": "error",
+                "output_text": error_text,
+                "steps": [],
+            }
+            db.finish_run(
+                run_id,
+                status="error",
+                ended_at=ended_at,
+                result_json=_json_dumps(result_payload),
+            )
+            return result_payload
+
+        workflow_input = dict(prepared.get("workflow_input") or {})
+        recorder = StepRecorder(run_id, event_sink=emit_event)
+        recorder.log_ingest(input_data=workflow_input, workflow_id=workflow_id)
+
+        execution = _execute_workflow_run(
+            workflow_id=workflow_id,
+            input=workflow_input,
+            recorder=recorder,
+            tool_defs=prepared.get("db_tool_defs") if isinstance(prepared.get("db_tool_defs"), list) else None,
+            workflow_defs=prepared.get("db_workflow_defs") if isinstance(prepared.get("db_workflow_defs"), list) else None,
+        )
+        status = str(execution.get("status") or "error")
+        output = execution.get("output") if isinstance(execution.get("output"), dict) else {}
+        output_text = (
+            str(output.get("answer") or "")
+            if status == "ok"
+            else str(output.get("error") or "Workflow execution failed.")
+        )
+        ended_at = _to_iso(_now_utc())
+
+        if status != "ok":
+            emit_event({"type": "error", "run_id": run_id, "message": output_text})
+
+        emit_event(
+            {
+                "type": "final",
+                "run_id": run_id,
+                "status": "ok" if status == "ok" else "error",
+                "output_text": output_text,
+                "ended_at": ended_at,
+            }
+        )
+
+        result_payload = {
+            "run_id": run_id,
+            "workflow_id": workflow_id,
+            "model_id": model_id,
+            "tool_ids": resolved_tool_ids,
+            "status": status,
+            "output_text": output_text,
+            "steps": _normalize_chat_steps(recorder.steps),
+        }
+        db.finish_run(
+            run_id,
+            status=status,
+            ended_at=ended_at,
+            result_json=_json_dumps(result_payload),
+        )
+        return result_payload
+    except Exception as exc:
+        error_text = _first_line(str(exc)) or "Workflow execution failed."
+        ended_at = _to_iso(_now_utc())
+        emit_event({"type": "error", "run_id": run_id, "message": error_text})
+        emit_event(
+            {
+                "type": "final",
+                "run_id": run_id,
+                "status": "error",
+                "output_text": error_text,
+                "ended_at": ended_at,
+            }
+        )
+        result_payload = {
+            "run_id": run_id,
+            "workflow_id": workflow_id,
+            "model_id": model_id,
+            "tool_ids": resolved_tool_ids,
+            "status": "error",
+            "output_text": error_text,
+            "steps": _normalize_chat_steps(recorder.steps if recorder else []),
+        }
+        db.finish_run(
+            run_id,
+            status="error",
+            ended_at=ended_at,
+            result_json=_json_dumps(result_payload),
+        )
+        return result_payload
+
+
+def _chat_error_response(
+    *,
+    workflow_id: str,
+    model_id: str,
+    output_text: str,
+) -> Dict[str, Any]:
+    return {
+        "run_id": "",
+        "workflow_id": workflow_id,
+        "model_id": model_id,
+        "tool_ids": [],
+        "status": "error",
+        "output_text": output_text,
+        "steps": [],
+    }
+
+
+def _normalize_chat_steps(raw_steps: Any) -> List[Dict[str, str]]:
+    steps: List[Dict[str, str]] = []
+    if not isinstance(raw_steps, list):
+        return steps
+    for step in raw_steps:
+        if not isinstance(step, dict):
+            continue
+        steps.append(
+            {
+                "name": str(step.get("name", "")),
+                "status": str(step.get("status", "ok")),
+                "started_at": str(step.get("started_at", "")),
+                "ended_at": str(step.get("ended_at", "")),
+                "summary": str(step.get("summary", "")),
+            }
+        )
+    return steps
+
+
+def _chat_response_from_workflow_result(
+    *,
+    workflow_result: Dict[str, Any],
+    workflow_id: str,
+    model_id: str,
+    resolved_tool_ids: List[str],
+) -> Dict[str, Any]:
+    status = str(workflow_result.get("status", "error"))
+    output = workflow_result.get("output")
+    output_text = ""
+    if isinstance(output, dict):
+        if status == "ok":
+            output_text = str(output.get("answer", ""))
+        else:
+            output_text = str(output.get("error", "Workflow execution failed"))
+
+    return {
+        "run_id": str(workflow_result.get("run_id", "")),
+        "workflow_id": workflow_id,
+        "model_id": model_id,
+        "tool_ids": resolved_tool_ids,
+        "status": status,
+        "output_text": output_text,
+        "steps": _normalize_chat_steps(workflow_result.get("steps")),
+    }
+
+
+def _prepare_chat_execution(
+    *,
+    workflow_id: str,
+    model_id: str,
+    tool_ids: List[str],
+    message: str,
+    vision_model_id: Optional[str] = None,
+    artifact_ids: Optional[List[str]] = None,
+    context: Optional[Dict[str, Any]] = None,
+    thread_id: Optional[str] = None,
+    token_emitter: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
     chat_context = dict(context or {})
     if thread_id:
         chat_context["thread_id"] = thread_id
+    if token_emitter is not None:
+        chat_context["_token_emitter"] = token_emitter
 
     normalized_artifact_ids = [
         str(item).strip()
@@ -496,23 +1091,23 @@ def run_chat_workflow(
     selected_workflow = workflows_map.get(workflow_id)
     if not isinstance(selected_workflow, dict):
         return {
-            "run_id": "",
-            "workflow_id": workflow_id,
-            "model_id": model_id,
-            "tool_ids": [],
-            "status": "error",
-            "output_text": f"Unknown workflow_id: {workflow_id}",
-            "steps": [],
+            "ok": False,
+            "resolved_tool_ids": [],
+            "response": _chat_error_response(
+                workflow_id=workflow_id,
+                model_id=model_id,
+                output_text=f"Unknown workflow_id: {workflow_id}",
+            ),
         }
     if str(selected_workflow.get("status") or "").lower() == "disabled":
         return {
-            "run_id": "",
-            "workflow_id": workflow_id,
-            "model_id": model_id,
-            "tool_ids": [],
-            "status": "error",
-            "output_text": f"Workflow '{workflow_id}' is disabled.",
-            "steps": [],
+            "ok": False,
+            "resolved_tool_ids": [],
+            "response": _chat_error_response(
+                workflow_id=workflow_id,
+                model_id=model_id,
+                output_text=f"Workflow '{workflow_id}' is disabled.",
+            ),
         }
 
     resolved_tool_ids = [str(item).strip() for item in tool_ids if str(item).strip()]
@@ -578,7 +1173,6 @@ def run_chat_workflow(
 
     db_tool_defs = db.list_tools()
     db_workflow_defs = db.list_workflows()
-
     workflow_input: Dict[str, Any] = {
         "task": message,
         "messages": [{"role": "user", "content": message}],
@@ -588,43 +1182,11 @@ def run_chat_workflow(
         "tool_defs": selected_tool_defs,
         "workflow_defs": db_workflow_defs,
     }
-
-    workflow_result = run_workflow(
-        workflow_id=workflow_id,
-        input=workflow_input,
-        tool_defs=db_tool_defs,
-        workflow_defs=db_workflow_defs,
-    )
-    status = str(workflow_result.get("status", "error"))
-    output = workflow_result.get("output")
-    output_text = ""
-    if isinstance(output, dict):
-        if status == "ok":
-            output_text = str(output.get("answer", ""))
-        else:
-            output_text = str(output.get("error", "Workflow execution failed"))
-
-    raw_steps = workflow_result.get("steps")
-    steps: List[Dict[str, str]] = []
-    if isinstance(raw_steps, list):
-        for step in raw_steps:
-            if not isinstance(step, dict):
-                continue
-            steps.append(
-                {
-                    "name": str(step.get("name", "")),
-                    "status": str(step.get("status", "ok")),
-                    "started_at": str(step.get("started_at", "")),
-                    "ended_at": str(step.get("ended_at", "")),
-                }
-            )
-
     return {
-        "run_id": str(workflow_result.get("run_id", "")),
-        "workflow_id": workflow_id,
-        "model_id": model_id,
-        "tool_ids": resolved_tool_ids,
-        "status": status,
-        "output_text": output_text,
-        "steps": steps,
+        "ok": True,
+        "resolved_tool_ids": resolved_tool_ids,
+        "selected_tool_defs": selected_tool_defs,
+        "db_tool_defs": db_tool_defs,
+        "db_workflow_defs": db_workflow_defs,
+        "workflow_input": workflow_input,
     }

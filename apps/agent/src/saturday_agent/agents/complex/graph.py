@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
+import httpx
 from langgraph.graph import END, START, StateGraph
 
 from saturday_agent.agents.complex.prompts import (
@@ -180,6 +181,69 @@ def _has_non_rag_tool_calls(calls: list[Dict[str, Any]]) -> bool:
     return False
 
 
+def _resolve_httpx_timeout(timeout_seconds: float) -> Optional[float]:
+    try:
+        timeout_value = float(timeout_seconds)
+    except (TypeError, ValueError):
+        return None
+    if timeout_value <= 0:
+        return None
+    return timeout_value
+
+
+def _extract_stream_chunk_text(payload: Dict[str, Any]) -> str:
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if content is not None:
+            return str(content)
+    response = payload.get("response")
+    if response is None:
+        return ""
+    return str(response)
+
+
+def _stream_ollama_chat(
+    *,
+    messages: List[Dict[str, Any]],
+    model: str,
+    base_url: str,
+    timeout_seconds: float,
+    options: Optional[Dict[str, Any]] = None,
+    on_token: Optional[Callable[[str], None]] = None,
+) -> str:
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }
+    if options:
+        payload["options"] = options
+
+    chunks: List[str] = []
+    with httpx.Client(
+        base_url=base_url,
+        timeout=_resolve_httpx_timeout(timeout_seconds),
+    ) as client:
+        with client.stream("POST", "/api/chat", json=payload) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                text = line.decode("utf-8") if isinstance(line, bytes) else str(line)
+                try:
+                    item = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                chunk = _extract_stream_chunk_text(item)
+                if chunk:
+                    chunks.append(chunk)
+                    if on_token:
+                        on_token(chunk)
+
+    return "".join(chunks).strip()
+
+
 def build_graph(
     *,
     config: RuntimeConfig,
@@ -305,7 +369,19 @@ def build_graph(
                 step_emitter(
                     StepEvent(
                         name=f"tool.{tool_id}",
+                        status="ok",
+                        phase="start",
+                        started_at=started_at,
+                        ended_at=started_at,
+                        input={"tool_id": tool_id, "input": tool_input},
+                        output={},
+                    )
+                )
+                step_emitter(
+                    StepEvent(
+                        name=f"tool.{tool_id}",
                         status=status,
+                        phase="end",
                         started_at=started_at,
                         ended_at=ended_at,
                         input={"tool_id": tool_id, "input": tool_input},
@@ -422,7 +498,19 @@ def build_graph(
             step_emitter(
                 StepEvent(
                     name="tool.rag.retrieve",
+                    status="ok",
+                    phase="start",
+                    started_at=started_at,
+                    ended_at=started_at,
+                    input={"tool_id": "rag.retrieve", "input": rag_input},
+                    output={},
+                )
+            )
+            step_emitter(
+                StepEvent(
+                    name="tool.rag.retrieve",
                     status=status,
+                    phase="end",
                     started_at=started_at,
                     ended_at=ended_at,
                     input={"tool_id": "rag.retrieve", "input": rag_input},
@@ -461,6 +549,9 @@ def build_graph(
         retrieval_context = _render_retrieval_context(state)
         model = str(state.get("model") or model_registry.get_default_model())
         options = state.get("options") if isinstance(state.get("options"), dict) else {}
+        context = dict(state.get("context") or {})
+        token_emitter = context.get("_token_emitter")
+        token_callback = token_emitter if callable(token_emitter) else None
 
         system_content = SYNTHESIZE_SYSTEM_PROMPT.format(
             plan=plan_text,
@@ -480,14 +571,24 @@ def build_graph(
             {"role": "user", "content": task},
         ]
 
-        raw = ollama_chat(
-            messages=messages,
-            model=model,
-            base_url=config.ollama_base_url,
-            timeout_seconds=config.ollama_timeout_seconds,
-            options=options,
-        )
-        answer = extract_assistant_text(raw).strip()
+        if token_callback:
+            answer = _stream_ollama_chat(
+                messages=messages,
+                model=model,
+                base_url=config.ollama_base_url,
+                timeout_seconds=config.ollama_timeout_seconds,
+                options=options,
+                on_token=token_callback,
+            )
+        else:
+            raw = ollama_chat(
+                messages=messages,
+                model=model,
+                base_url=config.ollama_base_url,
+                timeout_seconds=config.ollama_timeout_seconds,
+                options=options,
+            )
+            answer = extract_assistant_text(raw).strip()
         citations = list(state.get("citations") or [])
         answer = _append_sources(answer, citations)
 

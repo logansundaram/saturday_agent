@@ -42,11 +42,19 @@ def init_db(db_path: str) -> None:
                 status TEXT,
                 input_json TEXT,
                 output_json TEXT,
+                summary TEXT,
                 started_at TEXT,
                 ended_at TEXT
             )
             """
         )
+        if not _column_exists(conn, "steps", "summary"):
+            conn.execute(
+                """
+                ALTER TABLE steps
+                ADD COLUMN summary TEXT DEFAULT ''
+                """
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS state_snapshots (
@@ -169,6 +177,7 @@ def add_step(
     name: str,
     input_json: str,
     output_json: str,
+    summary: str,
     status: str,
     started_at: str,
     ended_at: str,
@@ -178,9 +187,9 @@ def add_step(
             """
             INSERT INTO steps (
                 run_id, step_index, name, status,
-                input_json, output_json, started_at, ended_at
+                input_json, output_json, summary, started_at, ended_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -189,6 +198,7 @@ def add_step(
                 status,
                 input_json,
                 output_json,
+                summary,
                 started_at,
                 ended_at,
             ),
@@ -216,7 +226,7 @@ def list_steps(run_id: str) -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, run_id, step_index, name, status,
-                   input_json, output_json, started_at, ended_at
+                   input_json, output_json, summary, started_at, ended_at
             FROM steps
             WHERE run_id = ?
             ORDER BY step_index ASC, id ASC
@@ -504,3 +514,11 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    for row in rows:
+        if str(row["name"] or "") == column_name:
+            return True
+    return False

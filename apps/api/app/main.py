@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
@@ -12,10 +13,10 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from app import artifacts, db, graph
+from app import artifacts, db, graph, streaming
 
 try:
     from dotenv import load_dotenv
@@ -49,6 +50,7 @@ class ChatRunRequest(BaseModel):
     vision_model_id: Optional[str] = None
     artifact_ids: List[str] = Field(default_factory=list)
     context: Optional[Dict[str, Any]] = None
+    stream: bool = False
 
 
 class ChatRunStep(BaseModel):
@@ -56,6 +58,7 @@ class ChatRunStep(BaseModel):
     status: Literal["ok", "error"]
     started_at: str
     ended_at: str
+    summary: Optional[str] = None
 
 
 class ChatRunResponse(BaseModel):
@@ -243,6 +246,7 @@ class RunLogStep(BaseModel):
     status: Literal["ok", "error"]
     started_at: str
     ended_at: str
+    summary: Optional[str] = None
     input: Any = None
     output: Any = None
     error: Optional[RunStepError] = None
@@ -876,6 +880,78 @@ async def chat(request: ChatRunRequest) -> ChatRunResponse:
     return ChatRunResponse(**result)
 
 
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRunRequest) -> StreamingResponse:
+    queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    stream_run_id = ""
+    final_sent = False
+
+    def emit_event(payload: Dict[str, Any]) -> None:
+        nonlocal stream_run_id, final_sent
+        event_payload = dict(payload)
+        maybe_run_id = str(event_payload.get("run_id") or "").strip()
+        if maybe_run_id:
+            stream_run_id = maybe_run_id
+        if str(event_payload.get("type") or "") == "final":
+            final_sent = True
+        loop.call_soon_threadsafe(queue.put_nowait, event_payload)
+
+    def run_stream() -> None:
+        try:
+            graph.run_chat_workflow_stream(
+                workflow_id=request.workflow_id,
+                model_id=request.model_id,
+                tool_ids=request.tool_ids,
+                message=request.message,
+                emit_event=emit_event,
+                vision_model_id=request.vision_model_id,
+                artifact_ids=request.artifact_ids,
+                context=request.context,
+                thread_id=request.thread_id,
+            )
+        except Exception as exc:
+            message = str(exc) or "Workflow execution failed."
+            emit_event(
+                {
+                    "type": "error",
+                    "run_id": stream_run_id,
+                    "message": message,
+                }
+            )
+            if not final_sent:
+                emit_event(
+                    {
+                        "type": "final",
+                        "run_id": stream_run_id,
+                        "status": "error",
+                        "output_text": message,
+                        "ended_at": _now_utc_iso(),
+                    }
+                )
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    asyncio.create_task(asyncio.to_thread(run_stream))
+
+    async def stream_events():
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield streaming.encode_sse_message(event)
+
+    return StreamingResponse(
+        stream_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/models", response_model=ModelsResponse)
 @app.get("/models/text", response_model=ModelsResponse)
 async def models() -> ModelsResponse:
@@ -1186,6 +1262,7 @@ async def run_logs(run_id: str) -> RunLogsResponse:
                 status=status,
                 started_at=str(step.get("started_at") or ""),
                 ended_at=str(step.get("ended_at") or ""),
+                summary=str(step.get("summary") or ""),
                 input=_json_loads(step.get("input_json")),
                 output=step_output,
                 error=_step_error(step_output, status),
@@ -1266,6 +1343,10 @@ async def run_state(run_id: str) -> RunStateResponse:
 # curl -X POST http://localhost:8000/chat \
 #   -H "Content-Type: application/json" \
 #   -d '{"message":"Find recent alerts","workflow_id":"complex.v1","model_id":"llama3.1:8b","tool_ids":["tool.custom.acme_search"]}'
+#
+# curl -N -X POST http://localhost:8000/chat/stream \
+#   -H "Content-Type: application/json" \
+#   -d '{"message":"Summarize our release notes","workflow_id":"simple.v1","model_id":"llama3.1:8b","tool_ids":[],"stream":true}'
 #
 # curl -X POST http://localhost:8000/workflow/compile \
 #   -H "Content-Type: application/json" \

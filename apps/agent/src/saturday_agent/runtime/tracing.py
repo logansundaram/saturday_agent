@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Literal, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 class StepEvent(BaseModel):
     name: str
     status: str
+    phase: Literal["start", "end"] = "end"
+    label: Optional[str] = None
     started_at: str
     ended_at: str
     input: Dict[str, Any] = Field(default_factory=dict)
@@ -47,6 +49,19 @@ def instrument_node(
         started_dt = datetime.now(timezone.utc)
         started_at = _to_iso(started_dt)
         input_snapshot = _state_snapshot(state)
+        if step_emitter:
+            step_emitter(
+                StepEvent(
+                    name=name,
+                    status="ok",
+                    phase="start",
+                    label=name.replace("_", " "),
+                    started_at=started_at,
+                    ended_at=started_at,
+                    input=input_snapshot,
+                    output={},
+                )
+            )
 
         try:
             output = node_fn(state)
@@ -56,6 +71,8 @@ def instrument_node(
                     StepEvent(
                         name=name,
                         status="ok",
+                        phase="end",
+                        label=name.replace("_", " "),
                         started_at=started_at,
                         ended_at=ended_at,
                         input=input_snapshot,
@@ -70,6 +87,8 @@ def instrument_node(
                     StepEvent(
                         name=name,
                         status="error",
+                        phase="end",
+                        label=name.replace("_", " "),
                         started_at=started_at,
                         ended_at=ended_at,
                         input=input_snapshot,
