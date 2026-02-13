@@ -11,6 +11,10 @@ requires-python = ">=3.10"
 dependencies = [
   "langgraph",
   "httpx",
+  "langchain-ollama",
+  "langchain-qdrant",
+  "qdrant-client",
+  "pypdf",
   "pydantic>=2,<3",
 ]
 

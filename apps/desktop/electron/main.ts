@@ -1,10 +1,8 @@
 import { app, BrowserWindow } from 'electron'
-import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { startMetricsPolling, stopMetricsPolling } from './ipc/systemMetrics'
-
-const require = createRequire(import.meta.url)
+import { registerDocsIpcHandlers } from './ipc/api'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // The built directory structure
@@ -75,4 +73,7 @@ app.on('before-quit', () => {
   stopMetricsPolling()
 })
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  registerDocsIpcHandlers()
+  createWindow()
+})

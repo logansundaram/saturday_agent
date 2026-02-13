@@ -129,6 +129,20 @@ class ToolsResponse(BaseModel):
     tools: List[ToolSummary]
 
 
+class ToolInvokeRequest(BaseModel):
+    tool_id: str
+    input: Dict[str, Any] = Field(default_factory=dict)
+    context: Optional[Dict[str, Any]] = None
+
+
+class ToolInvokeResponse(BaseModel):
+    run_id: str
+    tool_id: str
+    status: str
+    output: Any = None
+    steps: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class CreateToolRequest(BaseModel):
     name: str
     id: Optional[str] = None
@@ -1023,6 +1037,24 @@ async def update_builder_workflow(
 async def tools() -> ToolsResponse:
     payload = graph.list_tools()
     return ToolsResponse(tools=[ToolSummary(**item) for item in payload])
+
+
+@app.post("/tools/invoke", response_model=ToolInvokeResponse)
+async def invoke_tool(request: ToolInvokeRequest) -> ToolInvokeResponse:
+    tool_id = str(request.tool_id or "").strip()
+    if not tool_id:
+        raise HTTPException(status_code=400, detail="tool_id is required.")
+    try:
+        result = graph.invoke_tool(
+            tool_id=tool_id,
+            tool_input=dict(request.input or {}),
+            context=dict(request.context or {}),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Tool invocation failed: {exc}") from exc
+    return ToolInvokeResponse(**result)
 
 
 @app.post("/builder/tools", response_model=ToolSummary)

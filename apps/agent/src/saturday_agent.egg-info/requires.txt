@@ -1,0 +1,7 @@
+langgraph
+httpx
+langchain-ollama
+langchain-qdrant
+qdrant-client
+pypdf
+pydantic<3,>=2

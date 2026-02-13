@@ -152,6 +152,19 @@ class WorkflowRegistry:
     def list_tools(self) -> List[Dict[str, Any]]:
         return self._tool_registry.list_tools()
 
+    def invoke_tool(
+        self,
+        *,
+        tool_id: str,
+        tool_input: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self._tool_registry.invoke_tool(
+            tool_id=tool_id,
+            tool_input=tool_input,
+            context=context,
+        )
+
     def list_models(self) -> Dict[str, Any]:
         return self._model_registry.list_models_payload()
 
@@ -263,19 +276,42 @@ class WorkflowRegistry:
 
         raw_planned_calls = final_state.get("tool_calls")
         planned_calls = raw_planned_calls if isinstance(raw_planned_calls, list) else []
+        selected_tool_ids = list(tool_ids)
+        fallback_tool_ids = list(tool_ids)
+
+        retrieval_state = final_state.get("retrieval")
+        retrieval_results = (
+            retrieval_state.get("results")
+            if isinstance(retrieval_state, dict)
+            else None
+        )
+        retrieval_ran = isinstance(retrieval_results, list)
+        if retrieval_ran:
+            fallback_tool_ids = [tool_id for tool_id in fallback_tool_ids if tool_id != "rag.retrieve"]
+            planned_calls = [
+                call
+                for call in planned_calls
+                if isinstance(call, dict)
+                and str(call.get("tool_id") or call.get("id") or "").strip() != "rag.retrieve"
+            ]
+
         existing_results = final_state.get("tool_results")
         has_existing_results = isinstance(existing_results, list) and len(existing_results) > 0
         post_graph_tool_execution = False
         if workflow.workflow_type == "moderate":
-            post_graph_tool_execution = not has_existing_results and bool(planned_calls or tool_ids)
+            post_graph_tool_execution = not has_existing_results and bool(
+                planned_calls or fallback_tool_ids
+            )
         elif workflow.workflow_type == "complex":
-            post_graph_tool_execution = not has_existing_results and bool(planned_calls or tool_ids)
+            post_graph_tool_execution = not has_existing_results and bool(
+                planned_calls or fallback_tool_ids
+            )
 
         if post_graph_tool_execution:
             executed_calls, executed_results = self._execute_selected_tools(
                 task=task,
                 context=context,
-                tool_ids=tool_ids,
+                tool_ids=fallback_tool_ids,
                 planned_calls=planned_calls,
                 step_emitter=step_emitter,
             )
@@ -288,8 +324,8 @@ class WorkflowRegistry:
             "plan": final_state.get("plan"),
             "artifacts": dict(final_state.get("artifacts") or {}),
         }
-        if tool_ids:
-            output["selected_tool_ids"] = tool_ids
+        if selected_tool_ids:
+            output["selected_tool_ids"] = selected_tool_ids
         if final_state.get("tool_calls"):
             output["tool_calls"] = list(final_state.get("tool_calls") or [])
         if final_state.get("tool_results"):

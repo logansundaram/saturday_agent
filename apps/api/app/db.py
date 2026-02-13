@@ -100,6 +100,41 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_docs (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ready',
+                ingested_at TEXT NULL,
+                error_message TEXT NULL,
+                collection TEXT NOT NULL DEFAULT 'saturday_docs'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_doc_chunks (
+                id TEXT PRIMARY KEY,
+                doc_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_local_doc_chunks_doc_id_chunk_index
+            ON local_doc_chunks (doc_id, chunk_index)
+            """
+        )
         conn.commit()
 
 

@@ -20,3 +20,15 @@ pip install -r requirements.txt
 ```
 
 This uses `-e ../agent` so `saturday_agent` is importable by the API app.
+
+## RAG Environment
+
+Set these variables to enable `rag.retrieve` with Qdrant + Ollama embeddings:
+
+```bash
+SATURDAY_DATA_DIR=./data
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_COLLECTION=saturday_docs
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_EMBED_MODEL=nomic-embed-text
+```

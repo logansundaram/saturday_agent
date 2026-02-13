@@ -17,6 +17,34 @@ from saturday_agent.tools.search_tavily import (
     SEARCH_OUTPUT_SCHEMA,
     search_web_tavily,
 )
+from saturday_agent.tools.rag_qdrant import (
+    RAG_RETRIEVE_INPUT_SCHEMA,
+    RAG_RETRIEVE_OUTPUT_SCHEMA,
+    TOOL_DESCRIPTION as RAG_TOOL_DESCRIPTION,
+    TOOL_NAME as RAG_TOOL_NAME,
+    retrieve_qdrant_chunks,
+)
+from saturday_agent.tools.rag_delete_doc import (
+    RAG_DELETE_DOC_INPUT_SCHEMA,
+    RAG_DELETE_DOC_OUTPUT_SCHEMA,
+    TOOL_DESCRIPTION as RAG_DELETE_DOC_DESCRIPTION,
+    TOOL_NAME as RAG_DELETE_DOC_NAME,
+    delete_rag_doc,
+)
+from saturday_agent.tools.rag_ingest_pdf import (
+    INGEST_PDF_INPUT_SCHEMA,
+    INGEST_PDF_OUTPUT_SCHEMA,
+    TOOL_DESCRIPTION as RAG_INGEST_TOOL_DESCRIPTION,
+    TOOL_NAME as RAG_INGEST_TOOL_NAME,
+    ingest_pdf_document,
+)
+from saturday_agent.tools.rag_list_docs import (
+    RAG_LIST_DOCS_INPUT_SCHEMA,
+    RAG_LIST_DOCS_OUTPUT_SCHEMA,
+    TOOL_DESCRIPTION as RAG_LIST_DOCS_DESCRIPTION,
+    TOOL_NAME as RAG_LIST_DOCS_NAME,
+    list_rag_docs,
+)
 from saturday_agent.tools.vision_ollama import (
     TOOL_DESCRIPTION as VISION_TOOL_DESCRIPTION,
     TOOL_NAME as VISION_TOOL_NAME,
@@ -81,6 +109,54 @@ class ToolRegistry:
             input_schema=SEARCH_INPUT_SCHEMA,
             output_schema=SEARCH_OUTPUT_SCHEMA,
             handler=self._wrap_legacy_handler(search_web_tavily),
+            metadata={"source": "builtin"},
+        )
+        self.register_tool(
+            tool_id="rag.retrieve",
+            name=RAG_TOOL_NAME,
+            description=RAG_TOOL_DESCRIPTION,
+            kind="local",
+            type="builtin",
+            enabled=True,
+            input_schema=RAG_RETRIEVE_INPUT_SCHEMA,
+            output_schema=RAG_RETRIEVE_OUTPUT_SCHEMA,
+            handler=retrieve_qdrant_chunks,
+            metadata={"source": "builtin"},
+        )
+        self.register_tool(
+            tool_id="rag.ingest_pdf",
+            name=RAG_INGEST_TOOL_NAME,
+            description=RAG_INGEST_TOOL_DESCRIPTION,
+            kind="local",
+            type="builtin",
+            enabled=True,
+            input_schema=INGEST_PDF_INPUT_SCHEMA,
+            output_schema=INGEST_PDF_OUTPUT_SCHEMA,
+            handler=ingest_pdf_document,
+            metadata={"source": "builtin"},
+        )
+        self.register_tool(
+            tool_id="rag.list_docs",
+            name=RAG_LIST_DOCS_NAME,
+            description=RAG_LIST_DOCS_DESCRIPTION,
+            kind="local",
+            type="builtin",
+            enabled=True,
+            input_schema=RAG_LIST_DOCS_INPUT_SCHEMA,
+            output_schema=RAG_LIST_DOCS_OUTPUT_SCHEMA,
+            handler=list_rag_docs,
+            metadata={"source": "builtin"},
+        )
+        self.register_tool(
+            tool_id="rag.delete_doc",
+            name=RAG_DELETE_DOC_NAME,
+            description=RAG_DELETE_DOC_DESCRIPTION,
+            kind="local",
+            type="builtin",
+            enabled=True,
+            input_schema=RAG_DELETE_DOC_INPUT_SCHEMA,
+            output_schema=RAG_DELETE_DOC_OUTPUT_SCHEMA,
+            handler=delete_rag_doc,
             metadata={"source": "builtin"},
         )
         self.register_tool(

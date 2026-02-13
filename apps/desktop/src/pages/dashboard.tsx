@@ -7,8 +7,16 @@ import ToolPage from "../components/tool_page";
 import WorkflowPage from "../components/workflow_page";
 import Monitor from "../components/monitor";
 import LeftNav from "../components/left_nav";
+import LocalDocsPage from "./LocalDocsPage";
 
-type Page = "chat" | "models" | "tools" | "builder" | "workflows" | "inspect";
+type Page =
+  | "chat"
+  | "models"
+  | "tools"
+  | "builder"
+  | "workflows"
+  | "local_docs"
+  | "inspect";
 
 export default function Dashboard() {
   const [page, setPage] = useState<Page>("chat");
@@ -50,6 +58,8 @@ export default function Dashboard() {
         <BuilderPage />
       ) : page === "workflows" ? (
         <WorkflowPage />
+      ) : page === "local_docs" ? (
+        <LocalDocsPage />
       ) : page === "inspect" ? (
         <InspectPage runId={selectedInspectRunId} onBack={() => setPage("chat")} />
       ) : null}

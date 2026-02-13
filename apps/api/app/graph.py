@@ -262,6 +262,92 @@ def list_tools() -> List[Dict[str, Any]]:
     return registry.list_tools()
 
 
+def invoke_tool(
+    *,
+    tool_id: str,
+    tool_input: Dict[str, Any],
+    context: Optional[Dict[str, Any]] = None,
+    tool_defs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    run_id = str(uuid.uuid4())
+    started_at = _now_utc()
+
+    db_tools = _normalize_tool_definitions(db.list_tools())
+    merged_tool_defs = _merge_definitions(
+        db_tools,
+        _normalize_tool_definitions(tool_defs or []),
+        key="id",
+    )
+
+    runtime_registry = _runtime_registry(tool_defs=merged_tool_defs)
+    payload = {
+        "tool_id": str(tool_id or ""),
+        "input": dict(tool_input or {}),
+        "context": dict(context or {}),
+    }
+
+    db.create_run(
+        run_id,
+        "tool_invoke",
+        _json_dumps(payload),
+        _to_iso(started_at),
+    )
+
+    recorder = StepRecorder(run_id)
+    recorder.log_ingest(input_data=payload, workflow_id=f"tool:{tool_id}")
+
+    status = "ok"
+    tool_output: Dict[str, Any] = {}
+
+    step_started = _to_iso(_now_utc())
+    try:
+        raw_output = runtime_registry.invoke_tool(
+            tool_id=str(tool_id or ""),
+            tool_input=dict(tool_input or {}),
+            context=dict(context or {}),
+        )
+        tool_output = raw_output if isinstance(raw_output, dict) else {"value": raw_output}
+        if not bool(tool_output.get("ok", True)):
+            status = "error"
+    except Exception as exc:
+        status = "error"
+        tool_output = {
+            "ok": False,
+            "error": {
+                "kind": "runtime",
+                "message": str(exc),
+            },
+        }
+    step_ended = _to_iso(_now_utc())
+
+    recorder.emit(
+        StepEvent(
+            name=f"tool.{tool_id}",
+            status=status,
+            started_at=step_started,
+            ended_at=step_ended,
+            input={"tool_id": tool_id, "input": dict(tool_input or {})},
+            output={"tool_id": tool_id, "output": tool_output},
+        )
+    )
+
+    ended_at = _to_iso(_now_utc())
+    result_payload = {
+        "run_id": run_id,
+        "tool_id": str(tool_id or ""),
+        "status": status,
+        "output": tool_output,
+        "steps": recorder.steps,
+    }
+    db.finish_run(
+        run_id,
+        status=status,
+        ended_at=ended_at,
+        result_json=_json_dumps(result_payload),
+    )
+    return result_payload
+
+
 def route_workflow_type(
     *,
     task: str,

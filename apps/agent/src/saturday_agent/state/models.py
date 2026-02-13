@@ -107,9 +107,13 @@ class WorkflowState(TypedDict):
     messages: List[Dict[str, str]]
     artifact_ids: List[str]
     vision_model_id: Optional[str]
+    embedding_model: Optional[str]
+    retrieval_collection: Optional[str]
     plan: Optional[str]
     answer: Optional[str]
     artifacts: Dict[str, Any]
+    retrieval: Dict[str, Any]
+    citations: List[Dict[str, Any]]
     tool_calls: List[ToolCallRecord]
     tool_results: List[ToolResultRecord]
     tool_defs: List[ToolDefinition]
@@ -169,6 +173,17 @@ def build_initial_state(
     if raw_vision_model is None:
         raw_vision_model = options_map.get("vision_model_id")
     vision_model_id = str(raw_vision_model).strip() if raw_vision_model else None
+    raw_embedding_model = context_map.get("embedding_model")
+    if raw_embedding_model is None:
+        raw_embedding_model = options_map.get("embedding_model")
+    embedding_model = str(raw_embedding_model).strip() if raw_embedding_model else None
+
+    raw_retrieval_collection = context_map.get("retrieval_collection")
+    if raw_retrieval_collection is None:
+        raw_retrieval_collection = options_map.get("retrieval_collection")
+    retrieval_collection = (
+        str(raw_retrieval_collection).strip() if raw_retrieval_collection else None
+    )
 
     raw_tool_defs = context_map.get("tool_defs")
     tool_defs = (
@@ -190,9 +205,13 @@ def build_initial_state(
         messages=normalize_messages(messages or []),
         artifact_ids=artifact_ids,
         vision_model_id=vision_model_id,
+        embedding_model=embedding_model,
+        retrieval_collection=retrieval_collection,
         plan=None,
         answer=None,
         artifacts={},
+        retrieval={},
+        citations=[],
         tool_calls=[],
         tool_results=[],
         tool_defs=tool_defs,

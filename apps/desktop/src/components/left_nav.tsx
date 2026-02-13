@@ -1,4 +1,11 @@
-type Page = "chat" | "models" | "tools" | "builder" | "workflows" | "inspect";
+type Page =
+    | "chat"
+    | "models"
+    | "tools"
+    | "builder"
+    | "workflows"
+    | "local_docs"
+    | "inspect";
 
 interface LeftNavProps{
     page : Page;
@@ -14,7 +21,7 @@ export default function LeftNav({page, onNavigate} : LeftNavProps){
         <div className="fixed top-0 left-0 h-full bg-root w-50 p-4 z-50">
             <div className="text-left gap-y-2 grid">
                 <p className={itemClass("chat")} onClick={() => onNavigate("chat")}>
-                    New Chat
+                    Workspace
                 </p>
                 <p className={itemClass("models")} onClick={() => onNavigate("models")}>
                     Models
@@ -27,6 +34,9 @@ export default function LeftNav({page, onNavigate} : LeftNavProps){
                 </p>
                 <p className={itemClass("workflows")} onClick={() => onNavigate("workflows")}>
                     Workflows
+                </p>
+                <p className={itemClass("local_docs")} onClick={() => onNavigate("local_docs")}>
+                    Local Docs
                 </p>
                 <p className={itemClass("inspect")} onClick={() => onNavigate("inspect")}>
                     Inspect

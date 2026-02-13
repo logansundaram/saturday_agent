@@ -1,5 +1,4 @@
-import { BrowserWindow, app } from "electron";
-import { createRequire } from "node:module";
+import { BrowserWindow, ipcMain, dialog, app } from "electron";
 import { fileURLToPath } from "node:url";
 import path$4 from "node:path";
 import require$$0$1 from "os";
@@ -10,6 +9,7 @@ import require$$4 from "util";
 import require$$5 from "https";
 import require$$6 from "http";
 import require$$0$2 from "net";
+import { stat } from "node:fs/promises";
 function getDefaultExportFromCjs(x) {
   return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, "default") ? x["default"] : x;
 }
@@ -17802,7 +17802,7 @@ bluetooth.bluetoothDevices = bluetoothDevices;
 })(lib);
 const siModule = /* @__PURE__ */ getDefaultExportFromCjs(lib);
 const POLL_INTERVAL_MS = Number(process.env.SYSTEM_METRICS_INTERVAL_MS ?? 1e3);
-const API_BASE_URL = process.env.SATURDAY_API_URL ?? "http://localhost:8000";
+const API_BASE_URL$1 = process.env.SATURDAY_API_URL ?? "http://localhost:8000";
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? "http://localhost:11434";
 const si = typeof siModule.cpu === "function" ? siModule : siModule.default ?? siModule;
 let intervalId = null;
@@ -17899,7 +17899,7 @@ function normalizeGpu(graphicsInfo) {
 async function fetchBackendHealth() {
   var _a, _b;
   const [apiResult, ollamaResult] = await Promise.allSettled([
-    fetchJsonWithTimeout(`${API_BASE_URL}/health`, 1200),
+    fetchJsonWithTimeout(`${API_BASE_URL$1}/health`, 1200),
     fetchJsonWithTimeout(`${OLLAMA_BASE_URL}/api/tags`, 1200)
   ]);
   let apiStatus = "down";
@@ -17981,7 +17981,136 @@ function normalizePlatform(platform) {
   }
   return "linux";
 }
-createRequire(import.meta.url);
+const API_BASE_URL = process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+async function invokeTool(toolId, input, context) {
+  const response = await fetch(`${API_BASE_URL}/tools/invoke`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      tool_id: toolId,
+      input,
+      context: {}
+    })
+  });
+  if (!response.ok) {
+    let detail = `Tool invoke failed (${response.status})`;
+    try {
+      const payload = await response.json();
+      if (typeof payload.detail === "string" && payload.detail.trim()) {
+        detail = `${detail}: ${payload.detail}`;
+      }
+    } catch {
+    }
+    throw new Error(detail);
+  }
+  return await response.json();
+}
+function pickIngestOptions(value) {
+  const payload = value && typeof value === "object" ? value : {};
+  const output = {};
+  const passthroughKeys = [
+    "collection",
+    "embedding_model",
+    "chunk_size",
+    "chunk_overlap",
+    "index_to_qdrant"
+  ];
+  for (const key of passthroughKeys) {
+    if (payload[key] !== void 0) {
+      output[key] = payload[key];
+    }
+  }
+  return output;
+}
+function registerDocsIpcHandlers() {
+  ipcMain.removeHandler("docs:list");
+  ipcMain.removeHandler("docs:importPdf");
+  ipcMain.removeHandler("docs:delete");
+  ipcMain.handle("docs:list", async (_event, rawInput) => {
+    const payload = rawInput && typeof rawInput === "object" ? rawInput : {};
+    const input = {};
+    if (typeof payload.status === "string" && payload.status.trim()) {
+      input.status = payload.status.trim();
+    }
+    return invokeTool("rag.list_docs", input);
+  });
+  ipcMain.handle("docs:importPdf", async (_event, rawOptions) => {
+    const selected = await dialog.showOpenDialog({
+      title: "Import PDF documents",
+      properties: ["openFile", "multiSelections"],
+      filters: [{ name: "PDF Documents", extensions: ["pdf"] }]
+    });
+    if (selected.canceled || selected.filePaths.length === 0) {
+      return {
+        ok: true,
+        cancelled: true,
+        results: []
+      };
+    }
+    const ingestOptions = pickIngestOptions(rawOptions);
+    const results = [];
+    for (const candidatePath of selected.filePaths) {
+      const resolvedPath = path$4.resolve(candidatePath);
+      if (path$4.extname(resolvedPath).toLowerCase() !== ".pdf") {
+        continue;
+      }
+      try {
+        const metadata = await stat(resolvedPath);
+        if (!metadata.isFile()) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      try {
+        const run = await invokeTool("rag.ingest_pdf", {
+          ...ingestOptions,
+          file_path: resolvedPath
+        });
+        results.push({
+          file_path: resolvedPath,
+          ...run
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown ingest error.";
+        results.push({
+          file_path: resolvedPath,
+          run_id: "",
+          tool_id: "rag.ingest_pdf",
+          status: "error",
+          output: {
+            ok: false,
+            error: {
+              message
+            }
+          },
+          steps: []
+        });
+      }
+    }
+    return {
+      ok: results.every((item) => String(item.status || "error") === "ok"),
+      cancelled: false,
+      results
+    };
+  });
+  ipcMain.handle("docs:delete", async (_event, rawInput) => {
+    const payload = rawInput && typeof rawInput === "object" ? rawInput : {};
+    const input = {};
+    if (typeof payload.doc_id === "string" && payload.doc_id.trim()) {
+      input.doc_id = payload.doc_id.trim();
+    }
+    if (typeof payload.collection === "string" && payload.collection.trim()) {
+      input.collection = payload.collection.trim();
+    }
+    if (payload.delete_from_qdrant !== void 0) {
+      input.delete_from_qdrant = payload.delete_from_qdrant;
+    }
+    return invokeTool("rag.delete_doc", input);
+  });
+}
 const __dirname$1 = path$4.dirname(fileURLToPath(import.meta.url));
 process.env.APP_ROOT = path$4.join(__dirname$1, "..");
 const VITE_DEV_SERVER_URL = process.env["VITE_DEV_SERVER_URL"];
@@ -18023,7 +18152,10 @@ app.on("activate", () => {
 app.on("before-quit", () => {
   stopMetricsPolling();
 });
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  registerDocsIpcHandlers();
+  createWindow();
+});
 export {
   MAIN_DIST,
   RENDERER_DIST,
