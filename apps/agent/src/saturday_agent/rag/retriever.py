@@ -72,6 +72,7 @@ def retrieve(
     embeddings_model: str,
     top_k: int,
     filters: Dict[str, Any] | None,
+    qdrant_url: str | None = None,
 ) -> Dict[str, Any]:
     query_text = str(query or "").strip()
     if not query_text:
@@ -88,11 +89,17 @@ def retrieve(
         raise ValueError("embedding_model is required (input.embedding_model or OLLAMA_EMBED_MODEL).")
 
     resolved_top_k = _normalize_top_k(top_k)
-    qdrant_url = str(os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL)).strip()
+    resolved_qdrant_url = str(
+        qdrant_url or os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL)
+    ).strip()
+    if not resolved_qdrant_url:
+        raise ValueError(
+            "Qdrant URL is required (input.qdrant_url, context.qdrant_url, or QDRANT_URL)."
+        )
     ollama_base_url = str(os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)).strip()
 
     embeddings = get_ollama_embeddings(resolved_embedding_model, ollama_base_url)
-    store = get_vectorstore(resolved_collection, embeddings, qdrant_url)
+    store = get_vectorstore(resolved_collection, embeddings, resolved_qdrant_url)
     qdrant_filter = _build_qdrant_filter(filters)
 
     search_kwargs: Dict[str, Any] = {}

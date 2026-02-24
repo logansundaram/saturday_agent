@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 
 from langgraph.graph import END, START, StateGraph
@@ -16,12 +18,41 @@ from saturday_agent.llms.ollama_chat import extract_assistant_text, ollama_chat
 from saturday_agent.llms.registry import ModelRegistry
 from saturday_agent.routing.router import route_workflow_type
 from saturday_agent.runtime.config import RuntimeConfig, load_runtime_config
-from saturday_agent.runtime.tracing import StepEmitter, StepEvent, instrument_node
+from saturday_agent.runtime.tracing import ReplayControl, StepEmitter, StepEvent, instrument_node
 from saturday_agent.state.models import ToolDefinition, WorkflowDefinition as WorkflowDefModel
 from saturday_agent.state.models import WorkflowState, build_initial_state
 from saturday_agent.tools.registry import ToolRegistry
 
 _TEMPLATE_PATTERN = re.compile(r"\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}")
+_ALLOWED_EXPR_NODES = {
+    ast.Expression,
+    ast.BoolOp,
+    ast.UnaryOp,
+    ast.Compare,
+    ast.Name,
+    ast.Load,
+    ast.Constant,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.And,
+    ast.Or,
+    ast.Not,
+    ast.Eq,
+    ast.NotEq,
+    ast.Gt,
+    ast.GtE,
+    ast.Lt,
+    ast.LtE,
+    ast.In,
+    ast.NotIn,
+    ast.Is,
+    ast.IsNot,
+    ast.Attribute,
+    ast.Subscript,
+    ast.Index,
+    ast.Slice,
+}
 
 
 @dataclass(frozen=True)
@@ -115,6 +146,15 @@ class WorkflowRegistry:
                 continue
 
             graph = raw.get("graph") if isinstance(raw.get("graph"), dict) else {}
+            if not graph:
+                compiled = raw.get("compiled") if isinstance(raw.get("compiled"), dict) else {}
+                runtime_graph = (
+                    compiled.get("runtime_graph")
+                    if isinstance(compiled.get("runtime_graph"), dict)
+                    else None
+                )
+                if isinstance(runtime_graph, dict):
+                    graph = runtime_graph
             self._workflows[workflow_id] = WorkflowDefinition(
                 workflow_id=workflow_id,
                 workflow_type=str(raw.get("type") or "custom"),
@@ -206,6 +246,10 @@ class WorkflowRegistry:
         workflow_id: str,
         input: Dict[str, Any],
         step_emitter: Optional[StepEmitter] = None,
+        tool_call_gate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        initial_state: Optional[Dict[str, Any]] = None,
+        replay_mode: bool = False,
+        resume_node_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         workflow = self.get_workflow(workflow_id)
         if not workflow.enabled:
@@ -253,6 +297,16 @@ class WorkflowRegistry:
             options=options,
             default_model=self._model_registry.get_default_model(),
         )
+        if isinstance(initial_state, dict):
+            hydrated = copy.deepcopy(state)
+            for key, value in initial_state.items():
+                hydrated[str(key)] = copy.deepcopy(value)
+            state = hydrated
+
+        replay_control = ReplayControl(
+            replay_mode=replay_mode,
+            resume_node_id=resume_node_id,
+        )
 
         if not state.get("task") and not state.get("messages"):
             raise ValueError("Workflow input must include task or messages.")
@@ -262,6 +316,8 @@ class WorkflowRegistry:
                 workflow=workflow,
                 state=state,
                 step_emitter=step_emitter,
+                tool_call_gate=tool_call_gate,
+                replay_control=replay_control,
             )
         else:
             if workflow.build_graph_fn is None:
@@ -271,8 +327,11 @@ class WorkflowRegistry:
                 model_registry=self._model_registry,
                 tool_registry=self._tool_registry,
                 step_emitter=step_emitter,
+                replay_control=replay_control,
             )
             final_state = compiled_graph.invoke(state)
+        if replay_mode and str(resume_node_id or "").strip() and not replay_control.resume_matched:
+            raise ValueError(f"Replay resume node '{resume_node_id}' was not reached.")
 
         raw_planned_calls = final_state.get("tool_calls")
         planned_calls = raw_planned_calls if isinstance(raw_planned_calls, list) else []
@@ -314,6 +373,7 @@ class WorkflowRegistry:
                 tool_ids=fallback_tool_ids,
                 planned_calls=planned_calls,
                 step_emitter=step_emitter,
+                tool_call_gate=tool_call_gate,
             )
             if executed_calls:
                 final_state["tool_calls"] = executed_calls
@@ -389,6 +449,7 @@ class WorkflowRegistry:
         tool_ids: List[str],
         planned_calls: List[Dict[str, Any]],
         step_emitter: Optional[StepEmitter],
+        tool_call_gate: Optional[Callable[[Dict[str, Any]], bool]],
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         selected_ids = {str(tool_id).strip() for tool_id in tool_ids if str(tool_id).strip()}
         calls_to_run: List[Dict[str, Any]] = []
@@ -439,6 +500,20 @@ class WorkflowRegistry:
                 continue
             started_at = self._utc_now_iso()
             status = "ok"
+
+            if tool_call_gate:
+                allowed = bool(
+                    tool_call_gate(
+                        {
+                            "tool_id": tool_id,
+                            "tool_name": tool_name,
+                            "input": dict(tool_input or {}),
+                            "started_at": started_at,
+                        }
+                    )
+                )
+                if not allowed:
+                    raise ValueError(f"Tool '{tool_id}' rejected by sandbox policy.")
 
             try:
                 invoke_context = dict(context)
@@ -508,8 +583,15 @@ class WorkflowRegistry:
         workflow: WorkflowDefinition,
         state: WorkflowState,
         step_emitter: Optional[StepEmitter],
+        tool_call_gate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        replay_control: Optional[ReplayControl] = None,
     ) -> WorkflowState:
-        compiled = self._compile_custom_workflow(workflow=workflow, step_emitter=step_emitter)
+        compiled = self._compile_custom_workflow(
+            workflow=workflow,
+            step_emitter=step_emitter,
+            tool_call_gate=tool_call_gate,
+            replay_control=replay_control,
+        )
         final_state = compiled.invoke(state)
         if not isinstance(final_state, dict):
             raise ValueError("Custom workflow returned invalid state.")
@@ -520,6 +602,8 @@ class WorkflowRegistry:
         *,
         workflow: WorkflowDefinition,
         step_emitter: Optional[StepEmitter],
+        tool_call_gate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        replay_control: Optional[ReplayControl] = None,
     ) -> Any:
         graph = workflow.graph_spec if isinstance(workflow.graph_spec, dict) else {}
         raw_nodes = graph.get("nodes") if isinstance(graph.get("nodes"), list) else []
@@ -585,15 +669,21 @@ class WorkflowRegistry:
                     node_id=node_id,
                     config=config,
                     step_emitter=step_emitter,
+                    tool_call_gate=tool_call_gate,
                 )
-            elif node_type == "condition":
+            elif node_type in {"condition", "conditional"}:
                 node_fn = self._build_custom_condition_node(
                     node_id=node_id,
                     config=config,
                 )
-            elif node_type == "end":
+            elif node_type in {"end", "finalize"}:
                 node_fn = self._build_custom_end_node(
                     workflow=workflow,
+                    node_id=node_id,
+                    config=config,
+                )
+            elif node_type == "verify":
+                node_fn = self._build_custom_verify_node(
                     node_id=node_id,
                     config=config,
                 )
@@ -606,6 +696,7 @@ class WorkflowRegistry:
                     name=f"node.{node_id}",
                     node_fn=node_fn,
                     step_emitter=step_emitter,
+                    replay_control=replay_control,
                 ),
             )
 
@@ -632,7 +723,7 @@ class WorkflowRegistry:
 
             node_type = str(node.get("type") or "")
             outgoing = edges_by_from.get(node_id, [])
-            if node_type == "condition":
+            if node_type in {"condition", "conditional"}:
                 true_target = ""
                 false_target = ""
                 for edge in outgoing:
@@ -732,13 +823,19 @@ class WorkflowRegistry:
         node_id: str,
         config: Dict[str, Any],
         step_emitter: Optional[StepEmitter],
+        tool_call_gate: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> Callable[[Mapping[str, Any]], Dict[str, Any]]:
         def _node(state: Mapping[str, Any]) -> Dict[str, Any]:
-            tool_id = str(config.get("tool_id") or "").strip()
+            tool_id = str(config.get("tool_name") or config.get("tool_id") or "").strip()
             if not tool_id:
-                raise ValueError(f"Tool node '{node_id}' is missing tool_id.")
+                raise ValueError(f"Tool node '{node_id}' is missing tool_name.")
 
-            input_map = config.get("input_map") if isinstance(config.get("input_map"), dict) else {}
+            input_map = (
+                config.get("args_map")
+                if isinstance(config.get("args_map"), dict)
+                else config.get("input_map")
+            )
+            input_map = input_map if isinstance(input_map, dict) else {}
             payload: Dict[str, Any] = {}
             for key, expression in input_map.items():
                 output_key = str(key).strip()
@@ -760,11 +857,25 @@ class WorkflowRegistry:
                 invoke_context["model_id"] = str(state.get("model"))
 
             started_at = self._utc_now_iso()
+            tool_meta = self._tool_registry.get_tool(tool_id) or {}
+            if tool_call_gate:
+                allowed = bool(
+                    tool_call_gate(
+                        {
+                            "tool_id": tool_id,
+                            "tool_name": str(tool_meta.get("name") or tool_id),
+                            "input": dict(payload),
+                            "started_at": started_at,
+                        }
+                    )
+                )
+                if not allowed:
+                    raise ValueError(f"Tool '{tool_id}' rejected by sandbox policy.")
+
             output = self._tool_registry.invoke(tool_id=tool_id, tool_input=payload, context=invoke_context)
             status = "ok" if bool(output.get("ok", False)) else "error"
             ended_at = self._utc_now_iso()
 
-            tool_meta = self._tool_registry.get_tool(tool_id) or {}
             if step_emitter:
                 step_emitter(
                     StepEvent(
@@ -845,6 +956,59 @@ class WorkflowRegistry:
 
         return _node
 
+    def _build_custom_verify_node(
+        self,
+        *,
+        node_id: str,
+        config: Dict[str, Any],
+    ) -> Callable[[Mapping[str, Any]], Dict[str, Any]]:
+        def _node(state: Mapping[str, Any]) -> Dict[str, Any]:
+            mode = str(config.get("mode") or "rule").strip().lower()
+            verify_ok = False
+            verify_notes = ""
+
+            if mode == "llm":
+                prompt_template = str(config.get("prompt_template") or "").strip()
+                if not prompt_template:
+                    raise ValueError(f"Verify node '{node_id}' requires prompt_template in llm mode.")
+                prompt = self._render_state_template(
+                    template=prompt_template,
+                    state=state,
+                    payload={},
+                )
+                model_id = str(state.get("model") or self._model_registry.get_default_model())
+                raw = ollama_chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=model_id,
+                    base_url=self._config.ollama_base_url,
+                    timeout_seconds=self._config.ollama_timeout_seconds,
+                    options=dict(state.get("options") or {}),
+                )
+                verify_notes = extract_assistant_text(raw).strip()
+                verify_ok = verify_notes.lower().startswith("true") or "[pass]" in verify_notes.lower()
+            else:
+                expression = str(config.get("expression") or "").strip()
+                if not expression:
+                    raise ValueError(f"Verify node '{node_id}' requires expression in rule mode.")
+                verify_ok = self._safe_eval_expression(expression=expression, state=state)
+                verify_notes = (
+                    str(config.get("fail_message") or "").strip()
+                    if not verify_ok
+                    else "Rule verification passed."
+                )
+
+            output_key = str(config.get("output_key") or f"{node_id}_verified").strip() or f"{node_id}_verified"
+            artifacts = dict(state.get("artifacts") or {})
+            artifacts[output_key] = verify_ok
+            artifacts[f"{node_id}.notes"] = verify_notes
+            return {
+                "verify_ok": verify_ok,
+                "verify_notes": verify_notes,
+                "artifacts": artifacts,
+            }
+
+        return _node
+
     def _build_custom_end_node(
         self,
         *,
@@ -909,6 +1073,10 @@ class WorkflowRegistry:
         state: Mapping[str, Any],
         config: Dict[str, Any],
     ) -> bool:
+        expression = str(config.get("expression") or "").strip()
+        if expression:
+            return self._safe_eval_expression(expression=expression, state=state)
+
         field = str(config.get("field") or "").strip()
         operator = str(config.get("operator") or "exists").strip().lower()
         expected = config.get("value")
@@ -940,6 +1108,59 @@ class WorkflowRegistry:
                 return value in expected
             return False
         return False
+
+    def _safe_eval_expression(
+        self,
+        *,
+        expression: str,
+        state: Mapping[str, Any],
+    ) -> bool:
+        parsed = ast.parse(expression, mode="eval")
+        for node in ast.walk(parsed):
+            if isinstance(node, ast.Call):
+                raise ValueError("Expression calls are not allowed.")
+            if type(node) not in _ALLOWED_EXPR_NODES:
+                raise ValueError(f"Unsupported expression node: {type(node).__name__}")
+
+        state_dict = dict(state)
+        artifacts = dict(state.get("artifacts") or {})
+        context = dict(state.get("context") or {})
+
+        locals_map: Dict[str, Any] = {
+            "state": self._to_namespace(state_dict),
+            "artifacts": self._to_namespace(artifacts),
+            "context": self._to_namespace(context),
+            "task": str(state.get("task") or ""),
+            "answer": state.get("answer"),
+            "verify_ok": state.get("verify_ok"),
+            "verify_notes": state.get("verify_notes"),
+            "retry_count": int(state.get("retry_count") or 0),
+        }
+
+        for source in (state_dict, artifacts, context):
+            for key, value in source.items():
+                key_text = str(key).strip()
+                if key_text.isidentifier():
+                    locals_map[key_text] = value
+
+        value = eval(
+            compile(parsed, "<workflow-expression>", "eval"),
+            {"__builtins__": {}},
+            locals_map,
+        )
+        return bool(value)
+
+    def _to_namespace(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return SimpleNamespace(
+                **{
+                    str(key): self._to_namespace(item)
+                    for key, item in value.items()
+                }
+            )
+        if isinstance(value, list):
+            return [self._to_namespace(item) for item in value]
+        return value
 
     def _resolve_input_expression(self, *, expression: Any, state: Mapping[str, Any]) -> Any:
         if isinstance(expression, str):

@@ -10,7 +10,7 @@ from saturday_agent.agents.simple.prompts import SYSTEM_PROMPT, USER_PROMPT_TEMP
 from saturday_agent.llms.ollama_chat import extract_assistant_text, ollama_chat
 from saturday_agent.llms.registry import ModelRegistry
 from saturday_agent.runtime.config import RuntimeConfig
-from saturday_agent.runtime.tracing import StepEmitter, instrument_node
+from saturday_agent.runtime.tracing import ReplayControl, StepEmitter, instrument_node
 from saturday_agent.state.models import WorkflowState, append_trace
 from saturday_agent.tools.registry import ToolRegistry
 
@@ -105,6 +105,7 @@ def build_graph(
     model_registry: ModelRegistry,
     tool_registry: ToolRegistry,
     step_emitter: Optional[StepEmitter] = None,
+    replay_control: Optional[ReplayControl] = None,
 ) -> Any:
     _ = tool_registry
 
@@ -197,6 +198,7 @@ def build_graph(
             name="build_messages",
             node_fn=build_messages,
             step_emitter=step_emitter,
+            replay_control=replay_control,
         ),
     )
     builder.add_node(
@@ -205,6 +207,7 @@ def build_graph(
             name="llm_answer",
             node_fn=llm_answer,
             step_emitter=step_emitter,
+            replay_control=replay_control,
         ),
     )
     builder.add_node(
@@ -213,6 +216,7 @@ def build_graph(
             name="finalize",
             node_fn=finalize,
             step_emitter=step_emitter,
+            replay_control=replay_control,
         ),
     )
     builder.add_edge(START, "build_messages")

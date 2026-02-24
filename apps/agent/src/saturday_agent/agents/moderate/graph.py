@@ -17,7 +17,7 @@ from saturday_agent.agents.moderate.prompts import (
 from saturday_agent.llms.ollama_chat import extract_assistant_text, ollama_chat
 from saturday_agent.llms.registry import ModelRegistry
 from saturday_agent.runtime.config import RuntimeConfig
-from saturday_agent.runtime.tracing import StepEmitter, StepEvent, instrument_node
+from saturday_agent.runtime.tracing import ReplayControl, StepEmitter, StepEvent, instrument_node
 from saturday_agent.state.models import WorkflowState, append_trace
 from saturday_agent.tools.registry import ToolRegistry
 
@@ -237,6 +237,7 @@ def build_graph(
     model_registry: ModelRegistry,
     tool_registry: ToolRegistry,
     step_emitter: Optional[StepEmitter] = None,
+    replay_control: Optional[ReplayControl] = None,
 ) -> Any:
     def plan(state: WorkflowState) -> Dict[str, Any]:
         task = str(state.get("task") or "")
@@ -671,26 +672,59 @@ def build_graph(
         return "repair"
 
     builder = StateGraph(WorkflowState)
-    builder.add_node("plan", instrument_node(name="plan", node_fn=plan, step_emitter=step_emitter))
+    builder.add_node(
+        "plan",
+        instrument_node(
+            name="plan",
+            node_fn=plan,
+            step_emitter=step_emitter,
+            replay_control=replay_control,
+        ),
+    )
     builder.add_node(
         "rag_retrieve",
-        instrument_node(name="rag_retrieve", node_fn=rag_retrieve, step_emitter=step_emitter),
+        instrument_node(
+            name="rag_retrieve",
+            node_fn=rag_retrieve,
+            step_emitter=step_emitter,
+            replay_control=replay_control,
+        ),
     )
     builder.add_node(
         "llm_execute",
-        instrument_node(name="llm_execute", node_fn=llm_execute, step_emitter=step_emitter),
+        instrument_node(
+            name="llm_execute",
+            node_fn=llm_execute,
+            step_emitter=step_emitter,
+            replay_control=replay_control,
+        ),
     )
     builder.add_node(
         "verify",
-        instrument_node(name="verify", node_fn=verify, step_emitter=step_emitter),
+        instrument_node(
+            name="verify",
+            node_fn=verify,
+            step_emitter=step_emitter,
+            replay_control=replay_control,
+        ),
     )
     builder.add_node(
         "repair",
-        instrument_node(name="repair", node_fn=repair, step_emitter=step_emitter),
+        instrument_node(
+            name="repair",
+            node_fn=repair,
+            step_emitter=step_emitter,
+            replay_control=replay_control,
+        ),
     )
     builder.add_node(
         "finalize",
-        instrument_node(name="finalize", node_fn=finalize, step_emitter=step_emitter),
+        instrument_node(
+            name="finalize",
+            node_fn=finalize,
+            step_emitter=step_emitter,
+            replay_control=replay_control,
+        ),
     )
 
     builder.add_edge(START, "plan")

@@ -24,6 +24,7 @@ def index_chunks_to_qdrant(
     source_path: str,
     collection: str,
     embeddings_model: str,
+    qdrant_url: str | None = None,
 ) -> Dict[str, Any]:
     texts = [str(item or "").strip() for item in chunks if str(item or "").strip()]
     if not texts:
@@ -35,11 +36,17 @@ def index_chunks_to_qdrant(
     resolved_model = str(
         embeddings_model or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_OLLAMA_EMBED_MODEL)
     ).strip()
-    qdrant_url = str(os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL)).strip()
+    resolved_qdrant_url = str(
+        qdrant_url or os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL)
+    ).strip()
+    if not resolved_qdrant_url:
+        raise ValueError(
+            "Qdrant URL is required (input.qdrant_url, context.qdrant_url, or QDRANT_URL)."
+        )
     ollama_base_url = str(os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)).strip()
 
     embeddings = get_ollama_embeddings(resolved_model, ollama_base_url)
-    vectorstore = get_vectorstore(resolved_collection, embeddings, qdrant_url)
+    vectorstore = get_vectorstore(resolved_collection, embeddings, resolved_qdrant_url)
 
     metadatas: list[Dict[str, Any]] = []
     ids: list[str] = []

@@ -25,6 +25,7 @@ RAG_DELETE_DOC_INPUT_SCHEMA: Dict[str, Any] = {
         "doc_id": {"type": "string"},
         "collection": {"type": "string", "default": DEFAULT_COLLECTION},
         "delete_from_qdrant": {"type": "boolean", "default": True},
+        "qdrant_url": {"type": "string"},
     },
     "required": ["doc_id"],
     "additionalProperties": False,
@@ -63,8 +64,15 @@ def _resolve_collection(payload: Dict[str, Any], context_map: Dict[str, Any]) ->
     ).strip()
 
 
-def _delete_from_qdrant(*, doc_id: str, collection: str) -> None:
-    qdrant_url = str(os.getenv("QDRANT_URL", "http://127.0.0.1:6333")).strip()
+def _resolve_qdrant_url(payload: Dict[str, Any], context_map: Dict[str, Any]) -> str:
+    return str(
+        payload.get("qdrant_url")
+        or context_map.get("qdrant_url")
+        or os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
+    ).strip()
+
+
+def _delete_from_qdrant(*, doc_id: str, collection: str, qdrant_url: str) -> None:
     client = QdrantClient(url=qdrant_url)
 
     doc_filter = qdrant_models.Filter(
@@ -98,6 +106,7 @@ def delete_rag_doc(
         collection = _resolve_collection(payload, context_map)
         if not collection:
             raise ValueError("collection must be provided or set via QDRANT_COLLECTION.")
+        qdrant_url = _resolve_qdrant_url(payload, context_map)
 
         delete_from_qdrant = _to_bool(payload.get("delete_from_qdrant"), default=True)
 
@@ -119,7 +128,11 @@ def delete_rag_doc(
         qdrant_error: Optional[Exception] = None
         if delete_from_qdrant:
             try:
-                _delete_from_qdrant(doc_id=doc_id, collection=collection)
+                _delete_from_qdrant(
+                    doc_id=doc_id,
+                    collection=collection,
+                    qdrant_url=qdrant_url,
+                )
             except Exception as exc:
                 qdrant_error = exc
 

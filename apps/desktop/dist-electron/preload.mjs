@@ -29,3 +29,21 @@ electron.contextBridge.exposeInMainWorld("system", {
     return () => electron.ipcRenderer.off("system:metrics", listener);
   }
 });
+electron.contextBridge.exposeInMainWorld("qdrant", {
+  status() {
+    return electron.ipcRenderer.invoke("qdrant:status");
+  },
+  restart() {
+    return electron.ipcRenderer.invoke("qdrant:restart");
+  },
+  stop() {
+    return electron.ipcRenderer.invoke("qdrant:stop");
+  },
+  subscribe(callback) {
+    const listener = (_event, payload) => {
+      callback(payload);
+    };
+    electron.ipcRenderer.on("qdrant:subscribe", listener);
+    return () => electron.ipcRenderer.off("qdrant:subscribe", listener);
+  }
+});

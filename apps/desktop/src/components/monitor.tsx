@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useQdrantStatus } from "../hooks/useQdrantStatus";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 
@@ -35,6 +36,7 @@ export default function Monitor() {
   const gpuBar = usageColor(gpuUsage);
 
   const backendStatus = metrics?.backend;
+  const qdrantStatus = useQdrantStatus();
 
   const backendBadges = useMemo(() => {
     if (!backendStatus) {
@@ -177,6 +179,27 @@ export default function Monitor() {
               <div className="text-[11px] text-secondary">
                 FastAPI & Ollama health checks
               </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Badge className={`border ${qdrantStatusBadgeClass(qdrantStatus.statusLabel)}`}>
+                  Qdrant{" "}
+                  {qdrantStatus.statusLabel === "running"
+                    ? "Running"
+                    : qdrantStatus.statusLabel === "starting"
+                    ? "Starting"
+                    : qdrantStatus.statusLabel === "error"
+                    ? "Error"
+                    : "Stopped"}
+                  {qdrantStatus.port ? `:${qdrantStatus.port}` : ""}
+                </Badge>
+              </div>
+              <div className="mt-2 text-[11px] text-secondary break-all">
+                Storage: {qdrantStatus.storagePath || "N/A"}
+              </div>
+              {qdrantStatus.error ? (
+                <div className="mt-1 text-[11px] text-rose-200">
+                  {qdrantStatus.error}
+                </div>
+              ) : null}
             </section>
           </div>
         </div>
@@ -252,4 +275,19 @@ function statusBadgeClass(status: "ok" | "down"): string {
   return status === "ok"
     ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-200"
     : "border-rose-400/40 bg-rose-500/10 text-rose-200";
+}
+
+function qdrantStatusBadgeClass(
+  status: "running" | "starting" | "error" | "stopped"
+): string {
+  if (status === "running") {
+    return "border-emerald-400/40 bg-emerald-500/10 text-emerald-200";
+  }
+  if (status === "starting") {
+    return "border-sky-400/40 bg-sky-500/10 text-sky-200";
+  }
+  if (status === "error") {
+    return "border-rose-400/40 bg-rose-500/10 text-rose-200";
+  }
+  return "border-white/20 bg-white/5 text-white/70";
 }

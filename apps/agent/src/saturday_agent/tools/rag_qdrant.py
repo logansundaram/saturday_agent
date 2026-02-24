@@ -36,6 +36,10 @@ RAG_RETRIEVE_INPUT_SCHEMA: Dict[str, Any] = {
             "type": "object",
             "description": "Optional Qdrant payload filter object.",
         },
+        "qdrant_url": {
+            "type": "string",
+            "description": "Optional Qdrant base URL override.",
+        },
         "include_text": {
             "type": "boolean",
             "default": True,
@@ -126,6 +130,11 @@ def retrieve_qdrant_chunks(
             or context_map.get("embedding_model")
             or os.getenv("OLLAMA_EMBED_MODEL", DEFAULT_EMBED_MODEL)
         ).strip()
+        qdrant_url = str(
+            payload.get("qdrant_url")
+            or context_map.get("qdrant_url")
+            or os.getenv("QDRANT_URL", "")
+        ).strip()
         top_k = _normalize_top_k(payload.get("top_k"))
 
         filters = payload.get("filters")
@@ -140,6 +149,7 @@ def retrieve_qdrant_chunks(
             embeddings_model=embedding_model,
             top_k=top_k,
             filters=filters,
+            qdrant_url=qdrant_url or None,
         )
 
         if not include_text:

@@ -33,7 +33,10 @@ export default function StepList({ steps, selectedIndex, onSelect }: StepListPro
       <div className="max-h-[32rem] space-y-1 overflow-auto pr-1">
         {steps.map((step, index) => {
           const selected = index === selectedIndex;
-          const ok = step.status === "ok";
+          const normalizedStatus = String(step.status || "").toLowerCase();
+          const ok = normalizedStatus === "ok" || normalizedStatus === "success" || normalizedStatus === "completed";
+          const running = normalizedStatus === "running" || normalizedStatus === "pending";
+          const skipped = normalizedStatus === "skipped";
           return (
             <button
               key={`${step.step_index}-${step.name}-${index}`}
@@ -53,14 +56,14 @@ export default function StepList({ steps, selectedIndex, onSelect }: StepListPro
                 <span
                   className={
                     "h-2 w-2 rounded-full " +
-                    (ok ? "bg-emerald-400" : "bg-rose-400")
+                    (ok ? "bg-emerald-400" : running ? "bg-sky-400" : skipped ? "bg-zinc-400" : "bg-rose-400")
                   }
                   aria-hidden="true"
                 />
               </div>
               <div className="mt-1 truncate text-sm text-primary">{step.name}</div>
               <div className="mt-1 text-[11px] text-secondary">
-                {ok ? "ok" : "error"} · {durationLabel(step)}
+                {normalizedStatus || "unknown"} · {durationLabel(step)}
               </div>
             </button>
           );
@@ -69,4 +72,3 @@ export default function StepList({ steps, selectedIndex, onSelect }: StepListPro
     </div>
   );
 }
-

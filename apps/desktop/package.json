@@ -8,7 +8,8 @@
     "dev:all": "bash ../../scripts/run-all.sh",
     "build": "tsc && vite build && electron-builder",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:builder": "node --experimental-strip-types --test tests/*.test.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.18",

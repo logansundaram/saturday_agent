@@ -32,3 +32,6 @@ QDRANT_COLLECTION=saturday_docs
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_EMBED_MODEL=nomic-embed-text
 ```
+
+For desktop embedded mode, Electron can provide `qdrant_url` at runtime via API handshake.
+In that case, setting `QDRANT_URL` manually is optional.

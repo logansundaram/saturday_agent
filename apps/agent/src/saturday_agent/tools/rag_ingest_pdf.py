@@ -46,6 +46,10 @@ INGEST_PDF_INPUT_SCHEMA: Dict[str, Any] = {
             "default": DEFAULT_OLLAMA_EMBED_MODEL,
             "description": "Installed Ollama embedding model id.",
         },
+        "qdrant_url": {
+            "type": "string",
+            "description": "Optional Qdrant base URL override.",
+        },
         "chunk_size": {
             "type": "integer",
             "default": 900,
@@ -119,6 +123,14 @@ def _resolve_embedding_model(payload: Dict[str, Any], context_map: Dict[str, Any
     ).strip()
 
 
+def _resolve_qdrant_url(payload: Dict[str, Any], context_map: Dict[str, Any]) -> str:
+    return str(
+        payload.get("qdrant_url")
+        or context_map.get("qdrant_url")
+        or os.getenv("QDRANT_URL", "")
+    ).strip()
+
+
 def _is_pdf_file(path: Path) -> bool:
     if path.suffix.lower() == ".pdf":
         return True
@@ -189,6 +201,7 @@ def ingest_pdf_document(
             raise ValueError(
                 "embedding_model must be provided or set via OLLAMA_EMBED_MODEL."
             )
+        qdrant_url = _resolve_qdrant_url(payload, context_map)
 
         chunk_size = _normalize_int(
             payload.get("chunk_size"),
@@ -254,6 +267,7 @@ def ingest_pdf_document(
                 source_path=str(stored_path),
                 collection=collection,
                 embeddings_model=embedding_model,
+                qdrant_url=qdrant_url or None,
             )
 
         doc_record = set_doc_status(

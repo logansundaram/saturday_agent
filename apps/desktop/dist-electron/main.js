@@ -1,6 +1,10 @@
-import { BrowserWindow, ipcMain, dialog, app } from "electron";
-import { fileURLToPath } from "node:url";
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+import { ipcMain, dialog, BrowserWindow, app } from "electron";
+import { stat, mkdir, chmod, writeFile } from "node:fs/promises";
 import path$4 from "node:path";
+import { fileURLToPath } from "node:url";
 import require$$0$1 from "os";
 import require$$1$1 from "fs";
 import require$$2 from "path";
@@ -9,7 +13,203 @@ import require$$4 from "util";
 import require$$5 from "https";
 import require$$6 from "http";
 import require$$0$2 from "net";
-import { stat } from "node:fs/promises";
+import { spawn as spawn$1 } from "node:child_process";
+import { existsSync, createWriteStream } from "node:fs";
+import net$1 from "node:net";
+const API_BASE_URL$2 = process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+async function invokeTool(toolId, input, options, context) {
+  var _a;
+  const mergedContext = {
+    ...{}
+  };
+  const runtimeQdrantUrl = (_a = options == null ? void 0 : options.getQdrantUrl) == null ? void 0 : _a.call(options);
+  if (runtimeQdrantUrl && !String(mergedContext.qdrant_url ?? "").trim()) {
+    mergedContext.qdrant_url = runtimeQdrantUrl;
+  }
+  const response = await fetch(`${API_BASE_URL$2}/tools/invoke`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      tool_id: toolId,
+      input,
+      context: mergedContext
+    })
+  });
+  if (!response.ok) {
+    let detail = `Tool invoke failed (${response.status})`;
+    try {
+      const payload = await response.json();
+      if (typeof payload.detail === "string" && payload.detail.trim()) {
+        detail = `${detail}: ${payload.detail}`;
+      }
+    } catch {
+    }
+    throw new Error(detail);
+  }
+  return await response.json();
+}
+function pickIngestOptions(value) {
+  const payload = value && typeof value === "object" ? value : {};
+  const output = {};
+  const passthroughKeys = [
+    "collection",
+    "embedding_model",
+    "chunk_size",
+    "chunk_overlap",
+    "index_to_qdrant"
+  ];
+  for (const key of passthroughKeys) {
+    if (payload[key] !== void 0) {
+      output[key] = payload[key];
+    }
+  }
+  return output;
+}
+function registerDocsIpcHandlers(options) {
+  ipcMain.removeHandler("docs:list");
+  ipcMain.removeHandler("docs:importPdf");
+  ipcMain.removeHandler("docs:delete");
+  ipcMain.handle("docs:list", async (_event, rawInput) => {
+    const payload = rawInput && typeof rawInput === "object" ? rawInput : {};
+    const input = {};
+    if (typeof payload.status === "string" && payload.status.trim()) {
+      input.status = payload.status.trim();
+    }
+    return invokeTool("rag.list_docs", input, options);
+  });
+  ipcMain.handle("docs:importPdf", async (_event, rawOptions) => {
+    const selected = await dialog.showOpenDialog({
+      title: "Import PDF documents",
+      properties: ["openFile", "multiSelections"],
+      filters: [{ name: "PDF Documents", extensions: ["pdf"] }]
+    });
+    if (selected.canceled || selected.filePaths.length === 0) {
+      return {
+        ok: true,
+        cancelled: true,
+        results: []
+      };
+    }
+    const ingestOptions = pickIngestOptions(rawOptions);
+    const results = [];
+    for (const candidatePath of selected.filePaths) {
+      const resolvedPath = path$4.resolve(candidatePath);
+      if (path$4.extname(resolvedPath).toLowerCase() !== ".pdf") {
+        continue;
+      }
+      try {
+        const metadata = await stat(resolvedPath);
+        if (!metadata.isFile()) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      try {
+        const run = await invokeTool("rag.ingest_pdf", {
+          ...ingestOptions,
+          file_path: resolvedPath
+        }, options);
+        results.push({
+          file_path: resolvedPath,
+          ...run
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown ingest error.";
+        results.push({
+          file_path: resolvedPath,
+          run_id: "",
+          tool_id: "rag.ingest_pdf",
+          status: "error",
+          output: {
+            ok: false,
+            error: {
+              message
+            }
+          },
+          steps: []
+        });
+      }
+    }
+    return {
+      ok: results.every((item) => String(item.status || "error") === "ok"),
+      cancelled: false,
+      results
+    };
+  });
+  ipcMain.handle("docs:delete", async (_event, rawInput) => {
+    const payload = rawInput && typeof rawInput === "object" ? rawInput : {};
+    const input = {};
+    if (typeof payload.doc_id === "string" && payload.doc_id.trim()) {
+      input.doc_id = payload.doc_id.trim();
+    }
+    if (typeof payload.collection === "string" && payload.collection.trim()) {
+      input.collection = payload.collection.trim();
+    }
+    if (payload.delete_from_qdrant !== void 0) {
+      input.delete_from_qdrant = payload.delete_from_qdrant;
+    }
+    return invokeTool("rag.delete_doc", input, options);
+  });
+}
+const SUBSCRIBE_CHANNEL = "qdrant:subscribe";
+const STATUS_CHANNEL = "qdrant:status";
+const STOP_CHANNEL = "qdrant:stop";
+const RESTART_CHANNEL = "qdrant:restart";
+const THROTTLE_MS = 750;
+function registerQdrantIpcHandlers(manager, options = {}) {
+  ipcMain.removeHandler(STATUS_CHANNEL);
+  ipcMain.removeHandler(STOP_CHANNEL);
+  ipcMain.removeHandler(RESTART_CHANNEL);
+  let pendingStatus = null;
+  let throttleTimer = null;
+  const flush = () => {
+    if (!pendingStatus) {
+      return;
+    }
+    const payload = pendingStatus;
+    pendingStatus = null;
+    for (const windowRef of BrowserWindow.getAllWindows()) {
+      if (!windowRef.isDestroyed()) {
+        windowRef.webContents.send(SUBSCRIBE_CHANNEL, payload);
+      }
+    }
+  };
+  const schedule = (status) => {
+    pendingStatus = status;
+    if (throttleTimer) {
+      return;
+    }
+    throttleTimer = setTimeout(() => {
+      throttleTimer = null;
+      flush();
+    }, THROTTLE_MS);
+  };
+  const unsubscribe = manager.subscribe((status) => {
+    schedule(status);
+  });
+  ipcMain.handle(STATUS_CHANNEL, async () => manager.getStatus());
+  ipcMain.handle(STOP_CHANNEL, async () => manager.stop());
+  ipcMain.handle(RESTART_CHANNEL, async () => {
+    const status = await manager.restart();
+    if (status.running && options.onRunning) {
+      await options.onRunning(status);
+    }
+    return manager.getStatus();
+  });
+  return () => {
+    unsubscribe();
+    ipcMain.removeHandler(STATUS_CHANNEL);
+    ipcMain.removeHandler(STOP_CHANNEL);
+    ipcMain.removeHandler(RESTART_CHANNEL);
+    if (throttleTimer) {
+      clearTimeout(throttleTimer);
+      throttleTimer = null;
+    }
+  };
+}
 function getDefaultExportFromCjs(x) {
   return x && x.__esModule && Object.prototype.hasOwnProperty.call(x, "default") ? x["default"] : x;
 }
@@ -17981,135 +18181,425 @@ function normalizePlatform(platform) {
   }
   return "linux";
 }
-const API_BASE_URL = process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
-async function invokeTool(toolId, input, context) {
-  const response = await fetch(`${API_BASE_URL}/tools/invoke`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      tool_id: toolId,
-      input,
-      context: {}
-    })
+const DEFAULT_QDRANT_PORT = 6333;
+const DEFAULT_QDRANT_GRPC_PORT = 6334;
+const READINESS_TIMEOUT_MS = 1e4;
+const READINESS_POLL_MS = 500;
+const HEALTH_INTERVAL_MS = 5e3;
+const PROCESS_STOP_TIMEOUT_MS = 2500;
+function delay$1(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
-  if (!response.ok) {
-    let detail = `Tool invoke failed (${response.status})`;
-    try {
-      const payload = await response.json();
-      if (typeof payload.detail === "string" && payload.detail.trim()) {
-        detail = `${detail}: ${payload.detail}`;
-      }
-    } catch {
-    }
-    throw new Error(detail);
-  }
-  return await response.json();
 }
-function pickIngestOptions(value) {
-  const payload = value && typeof value === "object" ? value : {};
-  const output = {};
-  const passthroughKeys = [
-    "collection",
-    "embedding_model",
-    "chunk_size",
-    "chunk_overlap",
-    "index_to_qdrant"
-  ];
-  for (const key of passthroughKeys) {
-    if (payload[key] !== void 0) {
-      output[key] = payload[key];
-    }
+function platformFolderName() {
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    return "macos-arm64";
   }
-  return output;
+  if (process.platform === "darwin" && process.arch === "x64") {
+    return "macos-x64";
+  }
+  if (process.platform === "win32" && process.arch === "x64") {
+    return "win-x64";
+  }
+  if (process.platform === "linux" && process.arch === "x64") {
+    return "linux-x64";
+  }
+  throw new Error(
+    `Unsupported platform/arch for embedded Qdrant: ${process.platform}/${process.arch}`
+  );
 }
-function registerDocsIpcHandlers() {
-  ipcMain.removeHandler("docs:list");
-  ipcMain.removeHandler("docs:importPdf");
-  ipcMain.removeHandler("docs:delete");
-  ipcMain.handle("docs:list", async (_event, rawInput) => {
-    const payload = rawInput && typeof rawInput === "object" ? rawInput : {};
-    const input = {};
-    if (typeof payload.status === "string" && payload.status.trim()) {
-      input.status = payload.status.trim();
-    }
-    return invokeTool("rag.list_docs", input);
-  });
-  ipcMain.handle("docs:importPdf", async (_event, rawOptions) => {
-    const selected = await dialog.showOpenDialog({
-      title: "Import PDF documents",
-      properties: ["openFile", "multiSelections"],
-      filters: [{ name: "PDF Documents", extensions: ["pdf"] }]
+class QdrantManager {
+  constructor() {
+    __publicField(this, "processRef", null);
+    __publicField(this, "logStream", null);
+    __publicField(this, "startPromise", null);
+    __publicField(this, "stopPromise", null);
+    __publicField(this, "healthInterval", null);
+    __publicField(this, "listeners", /* @__PURE__ */ new Set());
+    __publicField(this, "stoppingProcess", false);
+    __publicField(this, "status", {
+      running: false,
+      port: null,
+      storagePath: this.resolveStoragePath()
     });
-    if (selected.canceled || selected.filePaths.length === 0) {
-      return {
-        ok: true,
-        cancelled: true,
-        results: []
-      };
-    }
-    const ingestOptions = pickIngestOptions(rawOptions);
-    const results = [];
-    for (const candidatePath of selected.filePaths) {
-      const resolvedPath = path$4.resolve(candidatePath);
-      if (path$4.extname(resolvedPath).toLowerCase() !== ".pdf") {
-        continue;
-      }
-      try {
-        const metadata = await stat(resolvedPath);
-        if (!metadata.isFile()) {
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      try {
-        const run = await invokeTool("rag.ingest_pdf", {
-          ...ingestOptions,
-          file_path: resolvedPath
-        });
-        results.push({
-          file_path: resolvedPath,
-          ...run
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown ingest error.";
-        results.push({
-          file_path: resolvedPath,
-          run_id: "",
-          tool_id: "rag.ingest_pdf",
-          status: "error",
-          output: {
-            ok: false,
-            error: {
-              message
-            }
-          },
-          steps: []
-        });
-      }
-    }
-    return {
-      ok: results.every((item) => String(item.status || "error") === "ok"),
-      cancelled: false,
-      results
+  }
+  subscribe(listener) {
+    this.listeners.add(listener);
+    listener(this.getStatus());
+    return () => {
+      this.listeners.delete(listener);
     };
-  });
-  ipcMain.handle("docs:delete", async (_event, rawInput) => {
-    const payload = rawInput && typeof rawInput === "object" ? rawInput : {};
-    const input = {};
-    if (typeof payload.doc_id === "string" && payload.doc_id.trim()) {
-      input.doc_id = payload.doc_id.trim();
+  }
+  getStatus() {
+    return { ...this.status };
+  }
+  getUrl() {
+    if (!this.status.port) {
+      return null;
     }
-    if (typeof payload.collection === "string" && payload.collection.trim()) {
-      input.collection = payload.collection.trim();
+    return `http://127.0.0.1:${this.status.port}`;
+  }
+  setStatusError(error) {
+    this.patchStatus({ error: (error == null ? void 0 : error.trim()) || void 0 });
+  }
+  async start() {
+    if (this.status.running && this.processRef) {
+      return this.getStatus();
     }
-    if (payload.delete_from_qdrant !== void 0) {
-      input.delete_from_qdrant = payload.delete_from_qdrant;
+    if (this.startPromise) {
+      return this.startPromise;
     }
-    return invokeTool("rag.delete_doc", input);
-  });
+    if (this.stopPromise) {
+      await this.stopPromise;
+    }
+    this.startPromise = this.startInternal().catch((error) => {
+      const message = error instanceof Error ? error.message : "Failed to start embedded Qdrant.";
+      this.patchStatus({
+        running: false,
+        pid: void 0,
+        error: message,
+        port: this.status.port
+      });
+      return this.getStatus();
+    }).finally(() => {
+      this.startPromise = null;
+    });
+    return this.startPromise;
+  }
+  async stop() {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+    this.stopPromise = this.stopInternal().finally(() => {
+      this.stopPromise = null;
+    });
+    return this.stopPromise;
+  }
+  async restart() {
+    await this.stop();
+    return this.start();
+  }
+  async startInternal() {
+    var _a;
+    const storagePath = this.resolveStoragePath();
+    const logPath = this.resolveLogPath();
+    await mkdir(storagePath, { recursive: true });
+    await mkdir(path$4.dirname(logPath), { recursive: true });
+    const binaryPath = this.resolveBinaryPath();
+    if (!existsSync(binaryPath)) {
+      throw new Error(
+        `Embedded Qdrant binary not found at '${binaryPath}'. Bundle resources/qdrant binaries before starting the desktop app.`
+      );
+    }
+    await this.ensureExecutable(binaryPath);
+    const port = await this.choosePort();
+    const grpcPort = await this.chooseGrpcPort(port);
+    this.patchStatus({
+      running: false,
+      port,
+      storagePath,
+      pid: void 0,
+      error: void 0,
+      lastHealthCheckAt: void 0
+    });
+    const child = spawn$1(binaryPath, [], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        QDRANT__STORAGE__STORAGE_PATH: storagePath,
+        QDRANT__SERVICE__HTTP_PORT: String(port),
+        QDRANT__SERVICE__GRPC_PORT: String(grpcPort)
+      }
+    });
+    this.processRef = child;
+    this.patchStatus({ pid: child.pid ?? void 0 });
+    this.attachLogging(child, logPath);
+    this.attachChildLifecycle(child);
+    const ready = await this.waitForReady(child, port, READINESS_TIMEOUT_MS);
+    if (!ready) {
+      this.stoppingProcess = true;
+      try {
+        await this.terminateChild(child);
+      } finally {
+        this.stoppingProcess = false;
+      }
+      if (this.processRef === child) {
+        this.processRef = null;
+      }
+      const earlyError = (_a = this.status.error) == null ? void 0 : _a.trim();
+      if (earlyError) {
+        throw new Error(earlyError);
+      }
+      throw new Error(
+        `Embedded Qdrant did not become ready within ${READINESS_TIMEOUT_MS}ms.`
+      );
+    }
+    this.patchStatus({
+      running: true,
+      error: void 0,
+      lastHealthCheckAt: (/* @__PURE__ */ new Date()).toISOString()
+    });
+    this.startHealthChecks();
+    return this.getStatus();
+  }
+  async stopInternal() {
+    this.stopHealthChecks();
+    const child = this.processRef;
+    this.processRef = null;
+    if (child) {
+      this.stoppingProcess = true;
+      try {
+        await this.terminateChild(child);
+      } finally {
+        this.stoppingProcess = false;
+      }
+    }
+    if (this.logStream) {
+      this.logStream.end();
+      this.logStream = null;
+    }
+    this.patchStatus({
+      running: false,
+      pid: void 0,
+      port: null,
+      lastHealthCheckAt: void 0
+    });
+    return this.getStatus();
+  }
+  startHealthChecks() {
+    this.stopHealthChecks();
+    this.healthInterval = setInterval(() => {
+      void this.refreshHealth();
+    }, HEALTH_INTERVAL_MS);
+  }
+  stopHealthChecks() {
+    if (!this.healthInterval) {
+      return;
+    }
+    clearInterval(this.healthInterval);
+    this.healthInterval = null;
+  }
+  async refreshHealth() {
+    const port = this.status.port;
+    if (!port || !this.processRef) {
+      return;
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const healthy = await this.probeCollections(port);
+    if (!healthy && this.status.running) {
+      this.patchStatus({
+        lastHealthCheckAt: now,
+        error: "Embedded Qdrant health probe failed."
+      });
+      return;
+    }
+    this.patchStatus({ lastHealthCheckAt: now });
+  }
+  async waitForReady(child, port, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null) {
+        return false;
+      }
+      const now = (/* @__PURE__ */ new Date()).toISOString();
+      this.patchStatus({ lastHealthCheckAt: now });
+      if (await this.probeCollections(port)) {
+        return true;
+      }
+      await delay$1(READINESS_POLL_MS);
+    }
+    return false;
+  }
+  async probeCollections(port) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1200);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/collections`, {
+        signal: controller.signal
+      });
+      return response.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  async terminateChild(child) {
+    if (child.exitCode !== null) {
+      return;
+    }
+    child.kill("SIGTERM");
+    const exitedAfterTerm = await this.waitForExit(child, PROCESS_STOP_TIMEOUT_MS);
+    if (exitedAfterTerm) {
+      return;
+    }
+    child.kill("SIGKILL");
+    await this.waitForExit(child, PROCESS_STOP_TIMEOUT_MS);
+  }
+  waitForExit(child, timeoutMs) {
+    return new Promise((resolve) => {
+      let resolved = false;
+      const timeout = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          resolve(false);
+        }
+      }, timeoutMs);
+      child.once("exit", () => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          resolve(true);
+        }
+      });
+    });
+  }
+  attachLogging(child, logPath) {
+    var _a, _b;
+    if (this.logStream) {
+      this.logStream.end();
+      this.logStream = null;
+    }
+    this.logStream = createWriteStream(logPath, { flags: "a" });
+    const logLine = (line) => {
+      var _a2;
+      const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+      (_a2 = this.logStream) == null ? void 0 : _a2.write(`[${timestamp}] ${line}
+`);
+    };
+    (_a = child.stdout) == null ? void 0 : _a.on("data", (chunk) => {
+      logLine(String(chunk).trimEnd());
+    });
+    (_b = child.stderr) == null ? void 0 : _b.on("data", (chunk) => {
+      logLine(String(chunk).trimEnd());
+    });
+    child.on("error", (error) => {
+      logLine(`process-error: ${error.message}`);
+    });
+  }
+  attachChildLifecycle(child) {
+    child.once("error", (error) => {
+      this.patchStatus({
+        running: false,
+        error: `Embedded Qdrant process error: ${error.message}`
+      });
+    });
+    child.once("exit", (code, signal) => {
+      const wasStopping = this.stoppingProcess;
+      if (this.processRef === child) {
+        this.processRef = null;
+      }
+      this.stopHealthChecks();
+      this.patchStatus({
+        running: false,
+        pid: void 0,
+        port: null,
+        error: wasStopping ? this.status.error : this.status.error ?? `Embedded Qdrant exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`
+      });
+    });
+  }
+  async choosePort() {
+    if (await this.isPortAvailable(DEFAULT_QDRANT_PORT)) {
+      return DEFAULT_QDRANT_PORT;
+    }
+    return this.findEphemeralPort();
+  }
+  async chooseGrpcPort(httpPort) {
+    const preferred = httpPort === DEFAULT_QDRANT_PORT ? DEFAULT_QDRANT_GRPC_PORT : httpPort + 1;
+    if (preferred !== httpPort && await this.isPortAvailable(preferred)) {
+      return preferred;
+    }
+    const fallback = await this.findEphemeralPort();
+    if (fallback === httpPort) {
+      return this.findEphemeralPort();
+    }
+    return fallback;
+  }
+  async isPortAvailable(port) {
+    return new Promise((resolve) => {
+      const server = net$1.createServer();
+      server.once("error", () => {
+        resolve(false);
+      });
+      server.once("listening", () => {
+        server.close(() => {
+          resolve(true);
+        });
+      });
+      server.listen(port, "127.0.0.1");
+    });
+  }
+  async findEphemeralPort() {
+    return new Promise((resolve, reject) => {
+      const server = net$1.createServer();
+      server.once("error", (error) => {
+        reject(error);
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        if (!address || typeof address === "string") {
+          server.close(() => {
+            reject(new Error("Unable to allocate a free local port for Qdrant."));
+          });
+          return;
+        }
+        const selectedPort = address.port;
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve(selectedPort);
+        });
+      });
+    });
+  }
+  resolveStoragePath() {
+    const userData = app.isReady() ? app.getPath("userData") : path$4.resolve(process.cwd(), ".saturday", "desktop");
+    return path$4.join(userData, "qdrant", "storage");
+  }
+  resolveLogPath() {
+    const userData = app.getPath("userData");
+    return path$4.join(userData, "logs", "qdrant.log");
+  }
+  resolveBinaryPath() {
+    const platformFolder = platformFolderName();
+    const baseDir = app.isPackaged ? process.resourcesPath : path$4.resolve(process.env.APP_ROOT ?? path$4.join(__dirname, "..", ".."), "resources");
+    const rawBinary = path$4.join(baseDir, "qdrant", platformFolder, "qdrant");
+    if (process.platform !== "win32") {
+      return rawBinary;
+    }
+    if (existsSync(rawBinary)) {
+      return rawBinary;
+    }
+    return `${rawBinary}.exe`;
+  }
+  async ensureExecutable(binaryPath) {
+    if (process.platform === "win32") {
+      return;
+    }
+    try {
+      await chmod(binaryPath, 493);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown chmod failure.";
+      throw new Error(`Failed to make Qdrant binary executable: ${message}`);
+    }
+  }
+  patchStatus(partial) {
+    this.status = {
+      ...this.status,
+      ...partial,
+      storagePath: partial.storagePath ?? this.status.storagePath ?? this.resolveStoragePath()
+    };
+    this.emitStatus();
+  }
+  emitStatus() {
+    const snapshot = this.getStatus();
+    for (const listener of this.listeners) {
+      listener(snapshot);
+    }
+  }
 }
 const __dirname$1 = path$4.dirname(fileURLToPath(import.meta.url));
 process.env.APP_ROOT = path$4.join(__dirname$1, "..");
@@ -18117,7 +18607,78 @@ const VITE_DEV_SERVER_URL = process.env["VITE_DEV_SERVER_URL"];
 const MAIN_DIST = path$4.join(process.env.APP_ROOT, "dist-electron");
 const RENDERER_DIST = path$4.join(process.env.APP_ROOT, "dist");
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? path$4.join(process.env.APP_ROOT, "public") : RENDERER_DIST;
-let win;
+const API_BASE_URL = process.env.SATURDAY_API_URL ?? process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const qdrantManager = new QdrantManager();
+let teardownQdrantIpcHandlers = null;
+let win = null;
+let quitting = false;
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+async function configureApiQdrant(status) {
+  const qdrantUrl = status.port ? `http://127.0.0.1:${status.port}` : null;
+  if (!qdrantUrl) {
+    return;
+  }
+  const qdrantConfigPath = path$4.join(
+    app.getPath("userData"),
+    "qdrant",
+    "qdrant.json"
+  );
+  try {
+    await mkdir(path$4.dirname(qdrantConfigPath), { recursive: true });
+    await writeFile(
+      qdrantConfigPath,
+      JSON.stringify(
+        {
+          url: qdrantUrl,
+          updated_at: (/* @__PURE__ */ new Date()).toISOString()
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "Unable to write qdrant.json.";
+    qdrantManager.setStatusError(`Failed to persist Qdrant runtime config: ${detail}`);
+  }
+  let lastError = "";
+  for (let attempt = 1; attempt <= 10; attempt += 1) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/internal/qdrant/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: qdrantUrl })
+      });
+      if (response.ok) {
+        qdrantManager.setStatusError(void 0);
+        return;
+      }
+      let detail = `API returned ${response.status}`;
+      let normalizedDetail = "";
+      try {
+        const payload = await response.json();
+        if (typeof payload.detail === "string" && payload.detail.trim()) {
+          detail = payload.detail;
+          normalizedDetail = payload.detail.trim().toLowerCase();
+        }
+      } catch {
+      }
+      if (response.status === 404 && normalizedDetail === "not found") {
+        qdrantManager.setStatusError(void 0);
+        return;
+      }
+      lastError = `Failed to configure API Qdrant URL: ${detail}`;
+    } catch (error) {
+      lastError = error instanceof Error ? `Failed to configure API Qdrant URL: ${error.message}` : "Failed to configure API Qdrant URL.";
+    }
+    await delay(500);
+  }
+  qdrantManager.setStatusError(lastError);
+}
 function createWindow() {
   win = new BrowserWindow({
     icon: path$4.join(process.env.VITE_PUBLIC, "electron-vite.svg"),
@@ -18131,29 +18692,48 @@ function createWindow() {
     win == null ? void 0 : win.webContents.send("main-process-message", (/* @__PURE__ */ new Date()).toLocaleString());
   });
   if (VITE_DEV_SERVER_URL) {
-    win.loadURL(VITE_DEV_SERVER_URL);
+    void win.loadURL(VITE_DEV_SERVER_URL);
   } else {
-    win.loadFile(path$4.join(RENDERER_DIST, "index.html"));
+    void win.loadFile(path$4.join(RENDERER_DIST, "index.html"));
   }
   startMetricsPolling();
 }
 app.on("window-all-closed", () => {
+  stopMetricsPolling();
   if (process.platform !== "darwin") {
     app.quit();
     win = null;
   }
-  stopMetricsPolling();
 });
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
     createWindow();
   }
 });
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   stopMetricsPolling();
+  if (quitting) {
+    return;
+  }
+  quitting = true;
+  event.preventDefault();
+  void qdrantManager.stop().finally(() => {
+    teardownQdrantIpcHandlers == null ? void 0 : teardownQdrantIpcHandlers();
+    teardownQdrantIpcHandlers = null;
+    app.quit();
+  });
 });
-app.whenReady().then(() => {
-  registerDocsIpcHandlers();
+app.whenReady().then(async () => {
+  registerDocsIpcHandlers({
+    getQdrantUrl: () => qdrantManager.getUrl()
+  });
+  teardownQdrantIpcHandlers = registerQdrantIpcHandlers(qdrantManager, {
+    onRunning: configureApiQdrant
+  });
+  const status = await qdrantManager.start();
+  if (status.running) {
+    await configureApiQdrant(status);
+  }
   createWindow();
 });
 export {

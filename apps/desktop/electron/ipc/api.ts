@@ -4,6 +4,10 @@ import path from "node:path";
 
 const API_BASE_URL = process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
+type DocsIpcOptions = {
+  getQdrantUrl?: () => string | null;
+};
+
 type ToolInvokeResponse = {
   run_id: string;
   tool_id: string;
@@ -15,8 +19,17 @@ type ToolInvokeResponse = {
 async function invokeTool(
   toolId: string,
   input: Record<string, unknown>,
+  options?: DocsIpcOptions,
   context?: Record<string, unknown>
 ): Promise<ToolInvokeResponse> {
+  const mergedContext: Record<string, unknown> = {
+    ...(context ?? {}),
+  };
+  const runtimeQdrantUrl = options?.getQdrantUrl?.();
+  if (runtimeQdrantUrl && !String(mergedContext.qdrant_url ?? "").trim()) {
+    mergedContext.qdrant_url = runtimeQdrantUrl;
+  }
+
   const response = await fetch(`${API_BASE_URL}/tools/invoke`, {
     method: "POST",
     headers: {
@@ -25,7 +38,7 @@ async function invokeTool(
     body: JSON.stringify({
       tool_id: toolId,
       input,
-      context: context ?? {},
+      context: mergedContext,
     }),
   });
 
@@ -65,7 +78,7 @@ function pickIngestOptions(
   return output;
 }
 
-export function registerDocsIpcHandlers(): void {
+export function registerDocsIpcHandlers(options?: DocsIpcOptions): void {
   ipcMain.removeHandler("docs:list");
   ipcMain.removeHandler("docs:importPdf");
   ipcMain.removeHandler("docs:delete");
@@ -78,7 +91,7 @@ export function registerDocsIpcHandlers(): void {
     if (typeof payload.status === "string" && payload.status.trim()) {
       input.status = payload.status.trim();
     }
-    return invokeTool("rag.list_docs", input);
+    return invokeTool("rag.list_docs", input, options);
   });
 
   ipcMain.handle("docs:importPdf", async (_event, rawOptions?: unknown) => {
@@ -116,7 +129,7 @@ export function registerDocsIpcHandlers(): void {
         const run = await invokeTool("rag.ingest_pdf", {
           ...ingestOptions,
           file_path: resolvedPath,
-        });
+        }, options);
         results.push({
           file_path: resolvedPath,
           ...run,
@@ -161,6 +174,6 @@ export function registerDocsIpcHandlers(): void {
     if (payload.delete_from_qdrant !== undefined) {
       input.delete_from_qdrant = payload.delete_from_qdrant;
     }
-    return invokeTool("rag.delete_doc", input);
+    return invokeTool("rag.delete_doc", input, options);
   });
 }

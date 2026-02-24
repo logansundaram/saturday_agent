@@ -1,3 +1,17 @@
+import type {
+  ValidationDiagnostic,
+  WorkflowCompileResult,
+  WorkflowSpec,
+} from "@saturday/shared/workflow";
+import type {
+  ReplayDryRunResponse as SharedReplayDryRunResponse,
+  ReplayRequest as SharedReplayRequest,
+  ReplayResponse as SharedReplayResponse,
+  Run as SharedRun,
+  RunStepDetail as SharedRunStepDetail,
+  RunStepSummary as SharedRunStepSummary,
+  ToolCall as SharedToolCall,
+} from "@saturday/shared/run";
 import { streamSSE } from "./sse";
 
 export const API_BASE_URL =
@@ -293,43 +307,44 @@ export type ChatRunStreamEvent =
   | ChatRunStreamErrorEvent;
 
 export type WorkflowRunRequest = {
-  workflow_id: string;
+  workflow_version_id?: string;
+  workflow_id?: string;
+  draft_spec?: WorkflowSpec;
   input: Record<string, any>;
+  sandbox_mode?: boolean;
+  created_by?: string;
 };
 
 export type WorkflowRunResponse = {
   run_id: string;
   workflow_id: string;
-  workflow_type: string;
+  workflow_type?: string;
+  workflow_version_id?: string;
+  workflow_version_num?: number;
   status: string;
+  sandbox_mode?: boolean;
   output: Record<string, any>;
   steps: Array<Record<string, any>>;
+  diagnostics?: ValidationDiagnostic[];
 };
 
-export type Run = {
-  run_id: string;
-  kind?: string;
-  status: string;
-  workflow_id?: string;
-  workflow_type?: string;
-  model_id?: string;
-  tool_ids?: string[];
-  started_at?: string;
-  ended_at?: string;
-  payload?: any;
-  result?: any;
-};
+export type Run = SharedRun;
+export type StepToolCall = SharedToolCall;
 
 export type Step = {
+  step_id?: string;
   step_index: number;
   name: string;
-  status: "ok" | "error";
+  status: string;
+  node_id?: string;
+  node_type?: string;
   started_at?: string;
   ended_at?: string;
   summary?: string;
   input?: any;
   output?: any;
   error?: any;
+  tool_calls?: StepToolCall[];
 };
 
 export type RunLogs = {
@@ -348,6 +363,12 @@ export type RunState = {
   snapshots: RunSnapshot[];
   derived?: boolean;
 };
+
+export type RunStepSummary = SharedRunStepSummary;
+export type RunStepDetail = SharedRunStepDetail;
+export type ReplayRequest = SharedReplayRequest;
+export type ReplayResponse = SharedReplayResponse;
+export type ReplayDryRunResponse = SharedReplayDryRunResponse;
 
 type WorkflowsResponse = {
   workflows?: Workflow[];
@@ -381,12 +402,69 @@ type RunStateResponse = {
   derived?: boolean;
 };
 
+type RunStepsResponse = {
+  run_id?: string;
+  steps?: RunStepSummary[];
+};
+
+type RunStepDetailResponse = {
+  run_id?: string;
+  step?: RunStepDetail;
+};
+
+export type WorkflowVersionRecord = {
+  version_id: string;
+  workflow_id: string;
+  version_num: number;
+  spec?: WorkflowSpec;
+  compiled?: Record<string, unknown>;
+  created_at: string;
+  created_by: string;
+  workflow?: {
+    workflow_id: string;
+    name: string;
+    description: string;
+    enabled: boolean;
+    created_at: string;
+    updated_at: string;
+  };
+};
+
+export type WorkflowDetail = {
+  workflow_id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  latest_version?: WorkflowVersionRecord | null;
+  versions: WorkflowVersionRecord[];
+};
+
+export type PendingToolCall = {
+  tool_call_id: string;
+  run_id: string;
+  step_id?: number | null;
+  tool_name: string;
+  args: Record<string, unknown>;
+  approved_bool?: boolean | null;
+  started_at?: string;
+  status: string;
+};
+
 async function fetchJson<T>(
   path: string,
   init?: RequestInit,
   timeoutMs: number = REQUEST_TIMEOUT_MS
 ): Promise<T> {
   const controller = new AbortController();
+  const externalSignal = init?.signal;
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener("abort", abortFromExternal);
+    }
+  }
   const resolvedTimeoutMs = resolveTimeout(timeoutMs);
   const timeoutId =
     resolvedTimeoutMs === null
@@ -410,6 +488,8 @@ async function fetchJson<T>(
         const payload = (await response.json()) as { detail?: unknown };
         if (typeof payload.detail === "string" && payload.detail.trim()) {
           detail = `${detail}: ${payload.detail}`;
+        } else if (payload.detail !== undefined) {
+          detail = `${detail}: ${JSON.stringify(payload.detail)}`;
         }
       } catch {
         // Keep default message if error payload is not JSON.
@@ -429,6 +509,9 @@ async function fetchJson<T>(
   } finally {
     if (timeoutId !== null) {
       window.clearTimeout(timeoutId);
+    }
+    if (externalSignal) {
+      externalSignal.removeEventListener("abort", abortFromExternal);
     }
   }
 }
@@ -481,12 +564,81 @@ export async function setWorkflowEnabled(
   return updateWorkflow(workflowId, { enabled });
 }
 
+export async function compileWorkflowSpec(
+  workflowSpec: WorkflowSpec,
+  signal?: AbortSignal
+): Promise<WorkflowCompileResult> {
+  const payload = await fetchJson<WorkflowCompileResult>("/workflow/compile", {
+    method: "POST",
+    body: JSON.stringify({
+      workflow_spec: workflowSpec,
+    }),
+    signal,
+  });
+  return {
+    valid: Boolean(payload.valid),
+    workflow_spec: payload.workflow_spec,
+    compiled: payload.compiled || {},
+    diagnostics: Array.isArray(payload.diagnostics) ? payload.diagnostics : [],
+  };
+}
+
+export async function getWorkflowDetail(
+  workflowId: string,
+  signal?: AbortSignal
+): Promise<WorkflowDetail> {
+  const payload = await fetchJson<WorkflowDetail>(
+    `/workflow/${encodeURIComponent(workflowId)}`,
+    { signal }
+  );
+  return {
+    workflow_id: payload.workflow_id,
+    name: payload.name,
+    description: payload.description || "",
+    enabled: Boolean(payload.enabled),
+    latest_version: payload.latest_version || null,
+    versions: Array.isArray(payload.versions) ? payload.versions : [],
+  };
+}
+
+export async function getWorkflowVersions(
+  workflowId: string,
+  signal?: AbortSignal
+): Promise<WorkflowVersionRecord[]> {
+  const payload = await fetchJson<{
+    workflow_id: string;
+    versions?: WorkflowVersionRecord[];
+  }>(`/workflow/${encodeURIComponent(workflowId)}/versions`, { signal });
+  return Array.isArray(payload.versions) ? payload.versions : [];
+}
+
+export async function createWorkflowVersion(
+  workflowId: string,
+  workflowSpec: WorkflowSpec,
+  createdBy: string = "builder",
+  signal?: AbortSignal
+): Promise<WorkflowVersionRecord> {
+  return fetchJson<WorkflowVersionRecord>(
+    `/workflow/${encodeURIComponent(workflowId)}/versions`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        workflow_spec: workflowSpec,
+        created_by: createdBy,
+      }),
+      signal,
+    }
+  );
+}
+
 export async function runWorkflow(
-  payload: WorkflowRunRequest
+  payload: WorkflowRunRequest,
+  signal?: AbortSignal
 ): Promise<WorkflowRunResponse> {
   return fetchJson<WorkflowRunResponse>("/workflow/run", {
     method: "POST",
     body: JSON.stringify(payload),
+    signal,
   }, CHAT_REQUEST_TIMEOUT_MS);
 }
 
@@ -581,18 +733,131 @@ export async function chatRunStream(
   );
 }
 
-export async function getRun(runId: string): Promise<Run> {
-  return fetchJson<Run>(`/runs/${encodeURIComponent(runId)}`);
+export async function getRun(runId: string, signal?: AbortSignal): Promise<Run> {
+  return fetchJson<Run>(`/runs/${encodeURIComponent(runId)}`, { signal });
 }
 
-export async function getRunLogs(runId: string): Promise<RunLogs> {
+export async function getRunLogs(
+  runId: string,
+  signal?: AbortSignal
+): Promise<RunLogs> {
   const payload = await fetchJson<RunLogsResponse>(
-    `/runs/${encodeURIComponent(runId)}/logs`
+    `/runs/${encodeURIComponent(runId)}/logs`,
+    { signal }
   );
   return {
     run_id: typeof payload.run_id === "string" ? payload.run_id : runId,
     steps: Array.isArray(payload.steps) ? payload.steps : [],
   };
+}
+
+export async function getRunSteps(
+  runId: string,
+  signal?: AbortSignal
+): Promise<{ run_id: string; steps: RunStepSummary[] }> {
+  const payload = await fetchJson<RunStepsResponse>(
+    `/runs/${encodeURIComponent(runId)}/steps`,
+    { signal }
+  );
+  return {
+    run_id: typeof payload.run_id === "string" ? payload.run_id : runId,
+    steps: Array.isArray(payload.steps) ? payload.steps : [],
+  };
+}
+
+export async function getRunStepDetail(
+  runId: string,
+  stepId: string,
+  signal?: AbortSignal
+): Promise<{ run_id: string; step: RunStepDetail | null }> {
+  const payload = await fetchJson<RunStepDetailResponse>(
+    `/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(stepId)}`,
+    { signal }
+  );
+  return {
+    run_id: typeof payload.run_id === "string" ? payload.run_id : runId,
+    step: payload.step ?? null,
+  };
+}
+
+export async function replayRunDryRun(
+  runId: string,
+  request: ReplayRequest,
+  signal?: AbortSignal
+): Promise<ReplayDryRunResponse> {
+  const payload = await fetchJson<ReplayDryRunResponse>(
+    `/runs/${encodeURIComponent(runId)}/replay/dry_run`,
+    {
+      method: "POST",
+      body: JSON.stringify(request),
+      signal,
+    }
+  );
+  return {
+    new_run_id: payload.new_run_id ?? null,
+    diagnostics: Array.isArray(payload.diagnostics) ? payload.diagnostics : [],
+    fork_start_state:
+      payload.fork_start_state && typeof payload.fork_start_state === "object"
+        ? payload.fork_start_state
+        : null,
+    resume_node_id: payload.resume_node_id ?? null,
+  };
+}
+
+export async function replayRun(
+  runId: string,
+  request: ReplayRequest,
+  signal?: AbortSignal
+): Promise<ReplayResponse> {
+  const payload = await fetchJson<ReplayResponse>(
+    `/runs/${encodeURIComponent(runId)}/replay`,
+    {
+      method: "POST",
+      body: JSON.stringify(request),
+      signal,
+    }
+  );
+  return {
+    new_run_id: payload.new_run_id ?? null,
+    diagnostics: Array.isArray(payload.diagnostics) ? payload.diagnostics : [],
+    fork_start_state:
+      payload.fork_start_state && typeof payload.fork_start_state === "object"
+        ? payload.fork_start_state
+        : null,
+    resume_node_id: payload.resume_node_id ?? null,
+  };
+}
+
+export async function getPendingToolCalls(
+  runId: string,
+  signal?: AbortSignal
+): Promise<PendingToolCall[]> {
+  const payload = await fetchJson<{
+    run_id?: string;
+    pending?: PendingToolCall[];
+  }>(`/runs/${encodeURIComponent(runId)}/pending_tool_calls`, { signal });
+  return Array.isArray(payload.pending) ? payload.pending : [];
+}
+
+export async function approveToolCall(
+  runId: string,
+  toolCallId: string,
+  approved: boolean
+): Promise<{
+  run_id: string;
+  tool_call_id: string;
+  approved: boolean;
+  status: string;
+}> {
+  return fetchJson(
+    `/runs/${encodeURIComponent(runId)}/tool_calls/${encodeURIComponent(
+      toolCallId
+    )}/approve`,
+    {
+      method: "POST",
+      body: JSON.stringify({ approved }),
+    }
+  );
 }
 
 export async function getRunState(runId: string): Promise<RunState | null> {

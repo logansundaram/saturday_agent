@@ -26,10 +26,16 @@ export default function Dashboard() {
 
   useEffect(() => {
     const handler = (event: Event) => {
-      const customEvent = event as CustomEvent<{ page?: Page }>;
+      const customEvent = event as CustomEvent<{ page?: Page; runId?: string }>;
       const targetPage = customEvent.detail?.page;
       if (!targetPage) {
         return;
+      }
+      if (targetPage === "inspect") {
+        const nextRunId = String(customEvent.detail?.runId || "").trim();
+        if (nextRunId) {
+          setSelectedInspectRunId(nextRunId);
+        }
       }
       setPage(targetPage);
     };

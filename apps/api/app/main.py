@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import ipaddress
 import json
 import os
 import re
+import socket
+import threading
+import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -17,6 +22,9 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import artifacts, db, graph, streaming
+from app.services import qdrant_client as qdrant_client_service
+from app.workflows import service as workflow_service
+from app.workflows.validation import BASE_STATE_KEYS
 
 try:
     from dotenv import load_dotenv
@@ -75,6 +83,21 @@ class HealthResponse(BaseModel):
     ollama: Literal["ok", "down"]
     ollama_base_url: str
     model_default: str
+
+
+class QdrantConfigRequest(BaseModel):
+    url: str
+
+
+class QdrantConfigResponse(BaseModel):
+    ok: bool
+    url: str
+
+
+class RagHealthResponse(BaseModel):
+    qdrantReachable: bool
+    url: Optional[str] = None
+    error: Optional[str] = None
 
 
 class WorkflowSummary(BaseModel):
@@ -210,29 +233,47 @@ class UpdateWorkflowRequest(BaseModel):
 
 
 class WorkflowCompileRequest(BaseModel):
-    task: str
+    workflow_spec: Optional[Dict[str, Any]] = None
+    task: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
-    workflow_type: Optional[WorkflowType] = None
+    workflow_type: Optional[str] = None
 
 
 class WorkflowCompileResponse(BaseModel):
-    workflow_id: str
-    workflow_type: str
-    graph: Dict[str, Any]
+    valid: bool = True
+    workflow_id: str = ""
+    workflow_type: str = ""
+    graph: Dict[str, Any] = Field(default_factory=dict)
+    workflow_spec: Dict[str, Any] = Field(default_factory=dict)
+    compiled: Dict[str, Any] = Field(default_factory=dict)
+    diagnostics: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkflowRunRequest(BaseModel):
-    workflow_id: str
+    workflow_version_id: Optional[str] = None
+    workflow_id: Optional[str] = None
+    draft_spec: Optional[Dict[str, Any]] = None
     input: Dict[str, Any]
+    sandbox_mode: bool = False
+    created_by: str = "builder"
 
 
 class WorkflowRunResponse(BaseModel):
     run_id: str
     workflow_id: str
-    workflow_type: str
+    workflow_type: str = "custom"
+    workflow_version_id: str = ""
+    workflow_version_num: int = 0
     status: str
-    output: Dict[str, Any]
-    steps: List[Dict[str, Any]]
+    sandbox_mode: bool = False
+    output: Dict[str, Any] = Field(default_factory=dict)
+    steps: List[Dict[str, Any]] = Field(default_factory=list)
+    diagnostics: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class CreateWorkflowVersionRequest(BaseModel):
+    workflow_spec: Dict[str, Any]
+    created_by: str = "builder"
 
 
 class RunStepError(BaseModel):
@@ -241,14 +282,18 @@ class RunStepError(BaseModel):
 
 
 class RunLogStep(BaseModel):
+    step_id: str
     step_index: int
     name: str
-    status: Literal["ok", "error"]
+    status: str
     started_at: str
     ended_at: str
+    node_id: Optional[str] = None
+    node_type: Optional[str] = None
     summary: Optional[str] = None
     input: Any = None
     output: Any = None
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
     error: Optional[RunStepError] = None
 
 
@@ -262,6 +307,7 @@ class RunDetailResponse(BaseModel):
     kind: Literal["chat", "workflow"]
     status: str
     workflow_id: str
+    workflow_version_id: Optional[str] = None
     workflow_type: Optional[str] = None
     model_id: Optional[str] = None
     tool_ids: List[str] = Field(default_factory=list)
@@ -269,6 +315,14 @@ class RunDetailResponse(BaseModel):
     ended_at: Optional[str] = None
     payload: Any = None
     result: Any = None
+    sandbox_mode: bool = False
+    parent_run_id: Optional[str] = None
+    parent_step_id: Optional[str] = None
+    forked_from_state_json: Any = None
+    fork_patch_json: Any = None
+    fork_reason: Optional[str] = None
+    resume_from_node_id: Optional[str] = None
+    mode: str = "normal"
 
 
 class RunSnapshot(BaseModel):
@@ -281,6 +335,91 @@ class RunStateResponse(BaseModel):
     run_id: str
     snapshots: List[RunSnapshot]
     derived: bool = False
+
+
+class ReplayDiagnostic(BaseModel):
+    code: str
+    severity: Literal["error", "warning", "info"] = "error"
+    message: str
+    path: Optional[str] = None
+    expected: Optional[str] = None
+    actual: Optional[str] = None
+
+
+class RunStepSummary(BaseModel):
+    step_id: str
+    step_index: int
+    name: str
+    node_id: Optional[str] = None
+    node_type: Optional[str] = None
+    status: str
+    started_at: str
+    ended_at: str
+    summary: Optional[str] = None
+    replayable: bool = False
+    replay_disabled_reason: Optional[str] = None
+
+
+class RunStepsResponse(BaseModel):
+    run_id: str
+    steps: List[RunStepSummary] = Field(default_factory=list)
+
+
+class RunStepDetailModel(BaseModel):
+    step_id: str
+    step_index: int
+    name: str
+    node_id: Optional[str] = None
+    node_type: Optional[str] = None
+    status: str
+    started_at: str
+    ended_at: str
+    summary: Optional[str] = None
+    input: Any = None
+    output: Any = None
+    error: Any = None
+    pre_state: Any = None
+    post_state: Any = None
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    replayable: bool = False
+    replay_disabled_reason: Optional[str] = None
+
+
+class RunStepDetailResponse(BaseModel):
+    run_id: str
+    step: RunStepDetailModel
+
+
+class RunReplayRequest(BaseModel):
+    from_step_id: str
+    state_patch: Any = Field(default_factory=dict)
+    patch_mode: Literal["overlay", "replace", "jsonpatch"] = "overlay"
+    sandbox: Optional[bool] = None
+    base_state: Literal["pre", "post"] = "post"
+    replay_this_step: bool = False
+
+
+class RunReplayResponse(BaseModel):
+    new_run_id: Optional[str] = None
+    diagnostics: List[ReplayDiagnostic] = Field(default_factory=list)
+    fork_start_state: Optional[Dict[str, Any]] = None
+    resume_node_id: Optional[str] = None
+
+
+class PendingToolCallsResponse(BaseModel):
+    run_id: str
+    pending: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ToolCallApprovalRequest(BaseModel):
+    approved: bool
+
+
+class ToolCallApprovalResponse(BaseModel):
+    run_id: str
+    tool_call_id: str
+    approved: bool
+    status: str
 
 
 def _extract_boundary(content_type: str) -> bytes:
@@ -376,8 +515,17 @@ def _normalize_kind(raw_kind: Optional[str]) -> Literal["chat", "workflow"]:
     return "workflow"
 
 
-def _coerce_step_status(value: Any) -> Literal["ok", "error"]:
-    return "ok" if str(value or "").lower() == "ok" else "error"
+def _coerce_step_status(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"ok", "success", "completed"}:
+        return "success"
+    if normalized in {"pending", "running", "skipped", "error"}:
+        return normalized
+    return "error"
+
+
+def _is_success_step_status(value: Any) -> bool:
+    return _coerce_step_status(value) == "success"
 
 
 def _extract_run_metadata(payload: Any, result: Any) -> Dict[str, Any]:
@@ -420,8 +568,8 @@ def _extract_run_metadata(payload: Any, result: Any) -> Dict[str, Any]:
     }
 
 
-def _step_error(step_output: Any, status: Literal["ok", "error"]) -> Optional[Dict[str, str]]:
-    if status != "error":
+def _step_error(step_output: Any, status: str) -> Optional[Dict[str, str]]:
+    if _coerce_step_status(status) != "error":
         return None
     if isinstance(step_output, dict):
         raw_error = step_output.get("error")
@@ -435,6 +583,13 @@ def _step_error(step_output: Any, status: Literal["ok", "error"]) -> Optional[Di
         if isinstance(raw_error, str) and raw_error.strip():
             return {"message": raw_error}
     return {"message": "Step failed."}
+
+
+def _step_replay_disabled_reason(step: Dict[str, Any]) -> Optional[str]:
+    status = _coerce_step_status(step.get("status"))
+    if status != "success":
+        return "Step must be completed successfully before replay."
+    return None
 
 
 def _safe_state(value: Any) -> Dict[str, Any]:
@@ -469,8 +624,431 @@ def _derive_state_snapshots(payload: Any, steps: List[Dict[str, Any]]) -> List[D
     return snapshots
 
 
+def _deep_merge(base: Any, overlay: Any) -> Any:
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = {str(key): copy.deepcopy(value) for key, value in base.items()}
+        for key, value in overlay.items():
+            key_text = str(key)
+            if key_text in merged:
+                merged[key_text] = _deep_merge(merged[key_text], value)
+            else:
+                merged[key_text] = copy.deepcopy(value)
+        return merged
+    return copy.deepcopy(overlay)
+
+
+def _json_pointer_segments(path: str) -> List[str]:
+    if path == "":
+        return []
+    if not str(path).startswith("/"):
+        raise ValueError("JSONPatch path must start with '/'.")
+    raw = str(path).split("/")[1:]
+    return [segment.replace("~1", "/").replace("~0", "~") for segment in raw]
+
+
+def _resolve_json_pointer_parent(document: Any, path: str) -> Tuple[Any, str]:
+    segments = _json_pointer_segments(path)
+    if not segments:
+        return None, ""
+    current = document
+    for segment in segments[:-1]:
+        if isinstance(current, dict):
+            if segment not in current:
+                current[segment] = {}
+            current = current.get(segment)
+            continue
+        if isinstance(current, list):
+            if segment == "-":
+                raise ValueError("'-' is only valid in final JSONPatch segment.")
+            try:
+                index = int(segment)
+            except ValueError as exc:
+                raise ValueError(f"Invalid array index '{segment}'.") from exc
+            if index < 0 or index >= len(current):
+                raise ValueError(f"Array index '{segment}' is out of bounds.")
+            current = current[index]
+            continue
+        raise ValueError("JSONPatch path traverses a non-container value.")
+    return current, segments[-1]
+
+
+def _apply_jsonpatch(document: Any, operations: Any) -> Tuple[Any, List[ReplayDiagnostic]]:
+    diagnostics: List[ReplayDiagnostic] = []
+    current = copy.deepcopy(document)
+    if not isinstance(operations, list):
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="PATCH_INVALID",
+                severity="error",
+                message="jsonpatch mode requires a list of operations.",
+                path="$",
+            )
+        )
+        return current, diagnostics
+
+    for index, operation in enumerate(operations):
+        op_path = f"state_patch[{index}]"
+        if not isinstance(operation, dict):
+            diagnostics.append(
+                ReplayDiagnostic(
+                    code="PATCH_INVALID",
+                    severity="error",
+                    message="JSONPatch operation must be an object.",
+                    path=op_path,
+                )
+            )
+            continue
+        op_name = str(operation.get("op") or "").strip().lower()
+        pointer = str(operation.get("path") or "")
+        if op_name not in {"add", "remove", "replace"}:
+            diagnostics.append(
+                ReplayDiagnostic(
+                    code="PATCH_UNSUPPORTED_OP",
+                    severity="error",
+                    message=f"Unsupported jsonpatch op '{op_name}'.",
+                    path=op_path,
+                )
+            )
+            continue
+        try:
+            if pointer == "":
+                if op_name == "remove":
+                    diagnostics.append(
+                        ReplayDiagnostic(
+                            code="PATCH_INVALID",
+                            severity="error",
+                            message="Cannot remove the root path.",
+                            path=op_path,
+                        )
+                    )
+                    continue
+                current = copy.deepcopy(operation.get("value"))
+                continue
+
+            parent, segment = _resolve_json_pointer_parent(current, pointer)
+            if parent is None:
+                diagnostics.append(
+                    ReplayDiagnostic(
+                        code="PATCH_INVALID",
+                        severity="error",
+                        message="Invalid root-level patch operation.",
+                        path=op_path,
+                    )
+                )
+                continue
+
+            if isinstance(parent, dict):
+                if op_name == "remove":
+                    if segment not in parent:
+                        raise ValueError(f"Key '{segment}' does not exist for remove.")
+                    parent.pop(segment, None)
+                else:
+                    parent[segment] = copy.deepcopy(operation.get("value"))
+                continue
+
+            if isinstance(parent, list):
+                if segment == "-":
+                    if op_name == "remove":
+                        raise ValueError("'-' is not valid for remove.")
+                    parent.append(copy.deepcopy(operation.get("value")))
+                    continue
+                try:
+                    idx = int(segment)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid array index '{segment}'.") from exc
+                if op_name == "add":
+                    if idx < 0 or idx > len(parent):
+                        raise ValueError(f"Array index '{segment}' is out of bounds for add.")
+                    parent.insert(idx, copy.deepcopy(operation.get("value")))
+                elif op_name == "replace":
+                    if idx < 0 or idx >= len(parent):
+                        raise ValueError(f"Array index '{segment}' is out of bounds for replace.")
+                    parent[idx] = copy.deepcopy(operation.get("value"))
+                else:
+                    if idx < 0 or idx >= len(parent):
+                        raise ValueError(f"Array index '{segment}' is out of bounds for remove.")
+                    parent.pop(idx)
+                continue
+
+            raise ValueError("JSONPatch parent path is not addressable.")
+        except ValueError as exc:
+            diagnostics.append(
+                ReplayDiagnostic(
+                    code="PATCH_INVALID",
+                    severity="error",
+                    message=str(exc),
+                    path=op_path,
+                )
+            )
+
+    return current, diagnostics
+
+
+def _apply_state_patch(
+    *,
+    base_state: Any,
+    patch: Any,
+    patch_mode: str,
+) -> Tuple[Any, List[ReplayDiagnostic]]:
+    mode = str(patch_mode or "overlay").strip().lower()
+    if mode == "replace":
+        if not isinstance(patch, dict):
+            return base_state, [
+                ReplayDiagnostic(
+                    code="PATCH_INVALID",
+                    severity="error",
+                    message="replace mode requires a full object state payload.",
+                    path="state_patch",
+                )
+            ]
+        return copy.deepcopy(patch), []
+
+    if mode == "overlay":
+        if not isinstance(base_state, dict):
+            return base_state, [
+                ReplayDiagnostic(
+                    code="STATE_INVALID",
+                    severity="error",
+                    message="Base replay state must be an object.",
+                    path="base_state",
+                )
+            ]
+        if not isinstance(patch, dict):
+            return base_state, [
+                ReplayDiagnostic(
+                    code="PATCH_INVALID",
+                    severity="error",
+                    message="overlay mode requires an object payload.",
+                    path="state_patch",
+                )
+            ]
+        return _deep_merge(base_state, patch), []
+
+    if mode == "jsonpatch":
+        return _apply_jsonpatch(base_state, patch)
+
+    return base_state, [
+        ReplayDiagnostic(
+            code="PATCH_INVALID_MODE",
+            severity="error",
+            message=f"Unsupported patch_mode '{patch_mode}'.",
+            path="patch_mode",
+        )
+    ]
+
+
+def _python_type_name(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _matches_state_type(expected_type: str, value: Any) -> bool:
+    normalized = str(expected_type or "json").strip().lower()
+    if normalized == "json":
+        return True
+    if normalized == "string":
+        return isinstance(value, str)
+    if normalized == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if normalized == "bool":
+        return isinstance(value, bool)
+    return True
+
+
+def _validate_state_schema(
+    *,
+    state: Any,
+    workflow_spec: Dict[str, Any],
+) -> List[ReplayDiagnostic]:
+    diagnostics: List[ReplayDiagnostic] = []
+    if not isinstance(state, dict):
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="STATE_INVALID",
+                severity="error",
+                message="Replay state must be a JSON object.",
+                path="$",
+            )
+        )
+        return diagnostics
+
+    schema_items = workflow_spec.get("state_schema")
+    schema_list = schema_items if isinstance(schema_items, list) else []
+    declared_types: Dict[str, str] = {}
+    required_keys: set[str] = set()
+    for item in schema_list:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        if not key:
+            continue
+        declared_types[key] = str(item.get("type") or "json").strip().lower()
+        if bool(item.get("required", False)):
+            required_keys.add(key)
+
+    metadata = workflow_spec.get("metadata") if isinstance(workflow_spec.get("metadata"), dict) else {}
+    allow_additional = bool(metadata.get("allow_additional", False))
+    allowed_keys = set(BASE_STATE_KEYS.keys()) | set(declared_types.keys())
+    for key in state.keys():
+        key_text = str(key)
+        if not allow_additional and key_text not in allowed_keys:
+            diagnostics.append(
+                ReplayDiagnostic(
+                    code="UNKNOWN_KEY",
+                    severity="error",
+                    message=f"Unknown state key '{key_text}'.",
+                    path=f"state.{key_text}",
+                )
+            )
+
+    for required_key in sorted(required_keys):
+        if required_key not in state:
+            diagnostics.append(
+                ReplayDiagnostic(
+                    code="REQUIRED_KEY_MISSING",
+                    severity="error",
+                    message=f"Required state key '{required_key}' is missing.",
+                    path=f"state.{required_key}",
+                )
+            )
+
+    for key, expected in declared_types.items():
+        if key not in state:
+            continue
+        value = state.get(key)
+        if _matches_state_type(expected, value):
+            continue
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="TYPE_MISMATCH",
+                severity="error",
+                message=f"State key '{key}' expected '{expected}' but got '{_python_type_name(value)}'.",
+                path=f"state.{key}",
+                expected=expected,
+                actual=_python_type_name(value),
+            )
+        )
+
+    return diagnostics
+
+
+def _extract_resume_node(step: Dict[str, Any]) -> Optional[str]:
+    node_id = str(step.get("node_id") or "").strip()
+    node_type = str(step.get("node_type") or "").strip().lower()
+    if node_id and node_type in {"node", "tool"}:
+        return node_id
+    name = str(step.get("name") or "").strip()
+    if name.startswith("node."):
+        return name.replace("node.", "", 1)
+    if name.startswith("tool."):
+        return name.replace("tool.", "", 1)
+    if name in {"ingest_input", "runtime_error"}:
+        return None
+    if name:
+        return name
+    return None
+
+
+def _has_replay_errors(diagnostics: List[ReplayDiagnostic]) -> bool:
+    return any(str(item.severity) == "error" for item in diagnostics)
+
+
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class SandboxApprovalManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: Dict[str, threading.Event] = {}
+        self._decisions: Dict[str, bool] = {}
+
+    def request_decision(self, run_id: str, payload: Dict[str, Any]) -> bool:
+        tool_name = str(payload.get("tool_id") or payload.get("tool_name") or "").strip()
+        tool_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+        started_at = str(payload.get("started_at") or _now_utc_iso())
+
+        call_row = db.create_tool_call(
+            run_id=run_id,
+            step_id=None,
+            tool_name=tool_name or "tool",
+            args_json=json.dumps(tool_input, default=str),
+            started_at=started_at,
+            approved_bool=None,
+            status="pending",
+        )
+        tool_call_id = str(call_row.get("tool_call_id") or "")
+        if not tool_call_id:
+            raise RuntimeError("Failed to persist pending tool call.")
+
+        event = threading.Event()
+        with self._lock:
+            self._events[tool_call_id] = event
+
+        event.wait(timeout=24 * 60 * 60)
+        with self._lock:
+            approved = self._decisions.pop(tool_call_id, False)
+            self._events.pop(tool_call_id, None)
+
+        db.update_tool_call_approval(tool_call_id, approved)
+        if not approved:
+            db.finish_tool_call(
+                tool_call_id=tool_call_id,
+                status="rejected",
+                finished_at=_now_utc_iso(),
+                result_json=None,
+                error_json=json.dumps({"message": "Tool call rejected by user."}, default=str),
+            )
+        return bool(approved)
+
+    def submit_decision(self, run_id: str, tool_call_id: str, approved: bool) -> bool:
+        call_row = db.get_tool_call(tool_call_id)
+        if call_row is None:
+            return False
+        if str(call_row.get("run_id") or "") != run_id:
+            return False
+        if str(call_row.get("status") or "") not in {"pending", "approved", "rejected"}:
+            return False
+
+        with self._lock:
+            self._decisions[tool_call_id] = bool(approved)
+            event = self._events.get(tool_call_id)
+
+        db.update_tool_call_approval(tool_call_id, approved)
+        if event:
+            event.set()
+        else:
+            if not approved:
+                db.finish_tool_call(
+                    tool_call_id=tool_call_id,
+                    status="rejected",
+                    finished_at=_now_utc_iso(),
+                    result_json=None,
+                    error_json=json.dumps({"message": "Tool call rejected by user."}, default=str),
+                )
+            else:
+                db.finish_tool_call(
+                    tool_call_id=tool_call_id,
+                    status="approved",
+                    finished_at=_now_utc_iso(),
+                    result_json=None,
+                    error_json=None,
+                )
+        return True
+
+
+_SANDBOX_APPROVALS = SandboxApprovalManager()
 
 
 def _normalize_tool_id_fragment(value: str) -> str:
@@ -504,6 +1082,57 @@ def _generate_workflow_id(name: str, existing_ids: set[str]) -> str:
 def _is_valid_http_url(value: str) -> bool:
     parsed = urlparse(value.strip())
     return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    value = str(hostname or "").strip().lower()
+    if not value:
+        return False
+    if value in {"localhost", "127.0.0.1", "::1"}:
+        return True
+
+    try:
+        ip_value = ipaddress.ip_address(value)
+        return bool(ip_value.is_loopback)
+    except ValueError:
+        pass
+
+    try:
+        resolved = socket.getaddrinfo(value, None)
+    except socket.gaierror:
+        return False
+
+    loopback_only = True
+    for _, _, _, _, sockaddr in resolved:
+        ip_text = str(sockaddr[0] or "")
+        try:
+            if not ipaddress.ip_address(ip_text).is_loopback:
+                loopback_only = False
+                break
+        except ValueError:
+            loopback_only = False
+            break
+    return loopback_only
+
+
+def _is_local_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    return _is_loopback_host(client_host)
+
+
+def _normalize_local_qdrant_url(raw_url: str) -> str:
+    parsed = urlparse(str(raw_url or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Qdrant URL must use http or https.")
+    if not parsed.hostname:
+        raise ValueError("Qdrant URL must include a host.")
+    if not _is_loopback_host(parsed.hostname):
+        raise ValueError("Qdrant URL host must resolve to localhost/loopback.")
+
+    netloc = parsed.netloc or parsed.hostname
+    if not netloc:
+        raise ValueError("Qdrant URL must include host:port.")
+    return f"{parsed.scheme.lower()}://{netloc}".rstrip("/")
 
 
 def _normalize_headers(headers: Dict[str, str]) -> Dict[str, str]:
@@ -859,6 +1488,36 @@ async def health() -> HealthResponse:
     )
 
 
+@app.post("/internal/qdrant/config", response_model=QdrantConfigResponse)
+async def configure_qdrant_runtime(
+    request: Request,
+    payload: QdrantConfigRequest,
+) -> QdrantConfigResponse:
+    if not _is_local_request(request):
+        raise HTTPException(status_code=403, detail="Only localhost clients may configure Qdrant runtime.")
+
+    try:
+        normalized_url = _normalize_local_qdrant_url(payload.url)
+        stored_url = qdrant_client_service.set_qdrant_url(normalized_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to store Qdrant URL: {exc}") from exc
+
+    return QdrantConfigResponse(ok=True, url=stored_url)
+
+
+@app.get("/rag/health", response_model=RagHealthResponse)
+async def rag_health() -> RagHealthResponse:
+    url = qdrant_client_service.get_qdrant_url()
+    reachable, error = qdrant_client_service.is_qdrant_reachable(url)
+    return RagHealthResponse(
+        qdrantReachable=reachable,
+        url=url,
+        error=error if not reachable else None,
+    )
+
+
 @app.post("/chat", response_model=ChatRunResponse)
 async def chat(request: ChatRunRequest) -> ChatRunResponse:
     result = graph.run_chat_workflow(
@@ -1179,6 +1838,11 @@ async def create_builder_tool(request: CreateToolRequest) -> ToolSummary:
     return ToolSummary(**created)
 
 
+@app.post("/tools", response_model=ToolSummary)
+async def create_tool_v2(request: CreateToolRequest) -> ToolSummary:
+    return await create_builder_tool(request)
+
+
 @app.patch("/tools/{tool_id}", response_model=ToolSummary)
 async def update_tool(tool_id: str, request: UpdateToolRequest) -> ToolSummary:
     existing = db.get_tool(tool_id)
@@ -1202,21 +1866,258 @@ async def update_tool(tool_id: str, request: UpdateToolRequest) -> ToolSummary:
 async def workflow_compile(
     request: WorkflowCompileRequest,
 ) -> WorkflowCompileResponse:
+    if isinstance(request.workflow_spec, dict):
+        compile_payload = workflow_service.compile_workflow_spec(
+            workflow_spec=request.workflow_spec
+        )
+        normalized = (
+            compile_payload.get("workflow_spec")
+            if isinstance(compile_payload.get("workflow_spec"), dict)
+            else {}
+        )
+        compiled = (
+            compile_payload.get("compiled")
+            if isinstance(compile_payload.get("compiled"), dict)
+            else {}
+        )
+        return WorkflowCompileResponse(
+            valid=bool(compile_payload.get("valid", False)),
+            workflow_id=str(normalized.get("workflow_id") or ""),
+            workflow_type="custom",
+            graph=dict(compiled.get("runtime_graph") or {}),
+            workflow_spec=normalized,
+            compiled=compiled,
+            diagnostics=[
+                dict(item)
+                for item in list(compile_payload.get("diagnostics") or [])
+                if isinstance(item, dict)
+            ],
+        )
+
+    task = str(request.task or "").strip()
+    if not task:
+        raise HTTPException(
+            status_code=400,
+            detail="workflow_spec or task is required for /workflow/compile.",
+        )
+
     result = graph.compile_workflow(
-        task=request.task,
+        task=task,
         context=request.context,
         workflow_type=request.workflow_type,
     )
-    return WorkflowCompileResponse(**result)
+    return WorkflowCompileResponse(
+        valid=True,
+        workflow_id=str(result.get("workflow_id") or ""),
+        workflow_type=str(result.get("workflow_type") or ""),
+        graph=dict(result.get("graph") or {}),
+        workflow_spec={},
+        compiled={"runtime_graph": dict(result.get("graph") or {})},
+        diagnostics=[],
+    )
 
 
 @app.post("/workflow/run", response_model=WorkflowRunResponse)
 async def workflow_run(request: WorkflowRunRequest) -> WorkflowRunResponse:
-    result = graph.run_workflow(
-        workflow_id=request.workflow_id,
-        input=request.input,
+    selector_count = sum(
+        1
+        for item in (
+            bool(str(request.workflow_version_id or "").strip()),
+            bool(str(request.workflow_id or "").strip()),
+            isinstance(request.draft_spec, dict),
+        )
+        if item
     )
-    return WorkflowRunResponse(**result)
+    if selector_count != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Exactly one of workflow_version_id, workflow_id, or draft_spec must be provided."
+            ),
+        )
+
+    diagnostics: List[Dict[str, Any]] = []
+    workflow_defs_override: List[Dict[str, Any]] = []
+    resolved_workflow_id = ""
+    resolved_version_id = ""
+    resolved_version_num = 0
+
+    if str(request.workflow_version_id or "").strip():
+        version = db.get_workflow_version(str(request.workflow_version_id or "").strip())
+        if version is None:
+            raise HTTPException(status_code=404, detail="Workflow version not found.")
+        workflow_info = version.get("workflow") if isinstance(version.get("workflow"), dict) else {}
+        compiled = version.get("compiled") if isinstance(version.get("compiled"), dict) else {}
+        runtime_graph = compiled.get("runtime_graph") if isinstance(compiled.get("runtime_graph"), dict) else {}
+        resolved_workflow_id = str(version.get("workflow_id") or "")
+        resolved_version_id = str(version.get("version_id") or "")
+        resolved_version_num = int(version.get("version_num") or 0)
+        workflow_defs_override.append(
+            {
+                "id": resolved_workflow_id,
+                "name": str(workflow_info.get("name") or resolved_workflow_id),
+                "title": str(workflow_info.get("name") or resolved_workflow_id),
+                "description": str(workflow_info.get("description") or ""),
+                "type": "custom",
+                "source": "custom",
+                "enabled": True,
+                "graph": runtime_graph,
+                "compiled": compiled,
+                "spec": dict(version.get("spec") or {}),
+            }
+        )
+    elif str(request.workflow_id or "").strip():
+        latest_version = db.get_latest_workflow_version(str(request.workflow_id or "").strip())
+        if latest_version is None:
+            raise HTTPException(status_code=404, detail="Workflow not found.")
+        workflow_info = (
+            latest_version.get("workflow")
+            if isinstance(latest_version.get("workflow"), dict)
+            else {}
+        )
+        compiled = (
+            latest_version.get("compiled")
+            if isinstance(latest_version.get("compiled"), dict)
+            else {}
+        )
+        runtime_graph = (
+            compiled.get("runtime_graph")
+            if isinstance(compiled.get("runtime_graph"), dict)
+            else {}
+        )
+        resolved_workflow_id = str(latest_version.get("workflow_id") or "")
+        resolved_version_id = str(latest_version.get("version_id") or "")
+        resolved_version_num = int(latest_version.get("version_num") or 0)
+        workflow_defs_override.append(
+            {
+                "id": resolved_workflow_id,
+                "name": str(workflow_info.get("name") or resolved_workflow_id),
+                "title": str(workflow_info.get("name") or resolved_workflow_id),
+                "description": str(workflow_info.get("description") or ""),
+                "type": "custom",
+                "source": "custom",
+                "enabled": True,
+                "graph": runtime_graph,
+                "compiled": compiled,
+                "spec": dict(latest_version.get("spec") or {}),
+            }
+        )
+    else:
+        draft_payload = workflow_service.compile_draft_to_runtime_defs(
+            workflow_spec=dict(request.draft_spec or {})
+        )
+        compile_payload = (
+            draft_payload.get("compile")
+            if isinstance(draft_payload.get("compile"), dict)
+            else {}
+        )
+        diagnostics = [
+            dict(item)
+            for item in list(compile_payload.get("diagnostics") or [])
+            if isinstance(item, dict)
+        ]
+        if not bool(compile_payload.get("valid", False)):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Draft workflow failed validation.",
+                    "diagnostics": diagnostics,
+                },
+            )
+        workflow_def = (
+            draft_payload.get("workflow_def")
+            if isinstance(draft_payload.get("workflow_def"), dict)
+            else {}
+        )
+        resolved_workflow_id = str(workflow_def.get("id") or f"draft.workflow.{uuid.uuid4()}")
+        resolved_version_id = f"draft:{resolved_workflow_id}"
+        resolved_version_num = 0
+        workflow_defs_override.append(workflow_def)
+
+    run_input = dict(request.input or {})
+    resolved_run_id = str(uuid.uuid4())
+
+    if request.sandbox_mode:
+        def _tool_gate(payload: Dict[str, Any]) -> bool:
+            return _SANDBOX_APPROVALS.request_decision(
+                run_id=resolved_run_id,
+                payload=payload,
+            )
+
+        def _run_async() -> None:
+            graph.run_workflow(
+                workflow_id=resolved_workflow_id,
+                input=run_input,
+                workflow_defs=workflow_defs_override,
+                run_id=resolved_run_id,
+                workflow_version_id=resolved_version_id,
+                sandbox_mode=True,
+                tool_call_gate=_tool_gate,
+            )
+
+        threading.Thread(target=_run_async, daemon=True).start()
+        return WorkflowRunResponse(
+            run_id=resolved_run_id,
+            workflow_id=resolved_workflow_id,
+            workflow_version_id=resolved_version_id,
+            workflow_version_num=resolved_version_num,
+            status="running",
+            sandbox_mode=True,
+            diagnostics=diagnostics,
+            output={},
+            steps=[],
+        )
+
+    result = graph.run_workflow(
+        workflow_id=resolved_workflow_id,
+        input=run_input,
+        workflow_defs=workflow_defs_override,
+        run_id=resolved_run_id,
+        workflow_version_id=resolved_version_id,
+        sandbox_mode=False,
+    )
+    return WorkflowRunResponse(
+        run_id=str(result.get("run_id") or resolved_run_id),
+        workflow_id=str(result.get("workflow_id") or resolved_workflow_id),
+        workflow_type=str(result.get("workflow_type") or "custom"),
+        workflow_version_id=resolved_version_id,
+        workflow_version_num=resolved_version_num,
+        status=str(result.get("status") or "error"),
+        sandbox_mode=False,
+        output=result.get("output") if isinstance(result.get("output"), dict) else {},
+        steps=list(result.get("steps") or []),
+        diagnostics=diagnostics,
+    )
+
+
+@app.get("/workflow/{workflow_id}")
+async def workflow_detail_latest(workflow_id: str) -> Dict[str, Any]:
+    try:
+        return workflow_service.get_latest_workflow_payload(workflow_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/workflow/{workflow_id}/versions")
+async def workflow_versions(workflow_id: str) -> Dict[str, Any]:
+    versions = workflow_service.get_workflow_versions_payload(workflow_id)
+    return {"workflow_id": workflow_id, "versions": versions}
+
+
+@app.post("/workflow/{workflow_id}/versions")
+async def workflow_create_version(
+    workflow_id: str,
+    request: CreateWorkflowVersionRequest,
+) -> Dict[str, Any]:
+    try:
+        created = workflow_service.create_workflow_version(
+            workflow_id=workflow_id,
+            workflow_spec=dict(request.workflow_spec or {}),
+            created_by=request.created_by,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return created
 
 
 @app.get("/runs/{run_id}", response_model=RunDetailResponse)
@@ -1234,6 +2135,7 @@ async def run_detail(run_id: str) -> RunDetailResponse:
         kind=_normalize_kind(run_row.get("kind")),
         status=str(run_row.get("status") or ""),
         workflow_id=str(metadata.get("workflow_id") or ""),
+        workflow_version_id=str(run_row.get("workflow_version_id") or "") or None,
         workflow_type=metadata.get("workflow_type"),
         model_id=metadata.get("model_id"),
         tool_ids=metadata.get("tool_ids") or [],
@@ -1241,6 +2143,14 @@ async def run_detail(run_id: str) -> RunDetailResponse:
         ended_at=run_row.get("ended_at"),
         payload=payload,
         result=result,
+        sandbox_mode=bool(run_row.get("sandbox_mode")),
+        parent_run_id=str(run_row.get("parent_run_id") or "") or None,
+        parent_step_id=str(run_row.get("parent_step_id") or "") or None,
+        forked_from_state_json=_json_loads(run_row.get("forked_from_state_json")),
+        fork_patch_json=_json_loads(run_row.get("fork_patch_json")),
+        fork_reason=str(run_row.get("fork_reason") or "") or None,
+        resume_from_node_id=str(run_row.get("resume_from_node_id") or "") or None,
+        mode=str(run_row.get("mode") or "normal"),
     )
 
 
@@ -1251,25 +2161,489 @@ async def run_logs(run_id: str) -> RunLogsResponse:
         raise HTTPException(status_code=404, detail="Run not found")
 
     step_rows = db.read_steps(run_id)
+    tool_call_rows = db.list_tool_calls(run_id)
+    tool_calls_by_step: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for row in tool_call_rows:
+        step_id = row.get("step_id")
+        if step_id is None:
+            continue
+        try:
+            args = _json_loads(row.get("args_json"))
+        except Exception:
+            args = {}
+        try:
+            result_payload = _json_loads(row.get("result_json"))
+        except Exception:
+            result_payload = None
+        try:
+            error_payload = _json_loads(row.get("error_json"))
+        except Exception:
+            error_payload = None
+
+        tool_calls_by_step[int(step_id)].append(
+            {
+                "tool_call_id": str(row.get("tool_call_id") or ""),
+                "tool_name": str(row.get("tool_name") or ""),
+                "status": str(row.get("status") or "pending"),
+                "approved_bool": row.get("approved_bool"),
+                "started_at": str(row.get("started_at") or ""),
+                "finished_at": str(row.get("finished_at") or ""),
+                "args": args if isinstance(args, dict) else {},
+                "result": result_payload,
+                "error": error_payload,
+            }
+        )
+
     steps_payload: List[RunLogStep] = []
     for index, step in enumerate(step_rows):
         status = _coerce_step_status(step.get("status"))
         step_output = _json_loads(step.get("output_json"))
+        step_error_payload = _json_loads(step.get("error_json"))
+        step_id_value = step.get("step_id")
+        if step_id_value is None:
+            step_id_value = step.get("id")
+        external_step_id = db.format_step_id(step_id_value)
+        step_tool_calls = (
+            tool_calls_by_step.get(int(step_id_value))
+            if step_id_value is not None
+            else []
+        )
+        error_payload_source = (
+            step_error_payload
+            if step_error_payload is not None
+            else step_output
+        )
         steps_payload.append(
             RunLogStep(
+                step_id=external_step_id,
                 step_index=int(step.get("step_index") if step.get("step_index") is not None else index),
                 name=str(step.get("name") or ""),
                 status=status,
                 started_at=str(step.get("started_at") or ""),
                 ended_at=str(step.get("ended_at") or ""),
+                node_id=str(step.get("node_id") or "") or None,
+                node_type=str(step.get("node_type") or "") or None,
                 summary=str(step.get("summary") or ""),
                 input=_json_loads(step.get("input_json")),
                 output=step_output,
-                error=_step_error(step_output, status),
+                tool_calls=step_tool_calls if isinstance(step_tool_calls, list) else [],
+                error=_step_error(error_payload_source, status),
             )
         )
 
     return RunLogsResponse(run_id=run_id, steps=steps_payload)
+
+
+@app.get("/runs/{run_id}/steps", response_model=RunStepsResponse)
+async def run_steps(run_id: str) -> RunStepsResponse:
+    run_row = db.read_run(run_id)
+    if not run_row:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    step_rows = db.read_steps(run_id)
+    payload: List[RunStepSummary] = []
+    for index, step in enumerate(step_rows):
+        step_id_value = step.get("step_id")
+        if step_id_value is None:
+            step_id_value = step.get("id")
+        node_id = str(step.get("node_id") or "").strip() or _extract_resume_node(step)
+        node_type = str(step.get("node_type") or "").strip() or None
+        status = _coerce_step_status(step.get("status"))
+        replay_disabled_reason = _step_replay_disabled_reason({"status": status})
+        payload.append(
+            RunStepSummary(
+                step_id=db.format_step_id(step_id_value),
+                step_index=int(step.get("step_index") if step.get("step_index") is not None else index),
+                name=str(step.get("name") or ""),
+                node_id=node_id or None,
+                node_type=node_type,
+                status=status,
+                started_at=str(step.get("started_at") or ""),
+                ended_at=str(step.get("ended_at") or ""),
+                summary=str(step.get("summary") or ""),
+                replayable=replay_disabled_reason is None,
+                replay_disabled_reason=replay_disabled_reason,
+            )
+        )
+    return RunStepsResponse(run_id=run_id, steps=payload)
+
+
+@app.get("/runs/{run_id}/steps/{step_id}", response_model=RunStepDetailResponse)
+async def run_step_detail(run_id: str, step_id: str) -> RunStepDetailResponse:
+    run_row = db.read_run(run_id)
+    if not run_row:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    step = db.get_step(run_id, step_id)
+    if not step:
+        raise HTTPException(status_code=404, detail="Step not found")
+
+    tool_calls = []
+    for row in db.list_tool_calls_for_step(run_id, step.get("step_id")):
+        args_payload = _json_loads(row.get("args_json"))
+        result_payload = _json_loads(row.get("result_json"))
+        error_payload = _json_loads(row.get("error_json"))
+        tool_calls.append(
+            {
+                "tool_call_id": str(row.get("tool_call_id") or ""),
+                "tool_name": str(row.get("tool_name") or ""),
+                "status": str(row.get("status") or "pending"),
+                "approved_bool": row.get("approved_bool"),
+                "started_at": str(row.get("started_at") or ""),
+                "finished_at": str(row.get("finished_at") or ""),
+                "args": args_payload if isinstance(args_payload, dict) else {},
+                "result": result_payload,
+                "error": error_payload,
+            }
+        )
+
+    status = _coerce_step_status(step.get("status"))
+    replay_disabled_reason = _step_replay_disabled_reason({"status": status})
+    output_payload = _json_loads(step.get("output_json"))
+    error_payload = _json_loads(step.get("error_json"))
+    return RunStepDetailResponse(
+        run_id=run_id,
+        step=RunStepDetailModel(
+            step_id=db.format_step_id(step.get("step_id")),
+            step_index=int(step.get("step_index") if step.get("step_index") is not None else 0),
+            name=str(step.get("name") or ""),
+            node_id=str(step.get("node_id") or "") or _extract_resume_node(step),
+            node_type=str(step.get("node_type") or "") or None,
+            status=status,
+            started_at=str(step.get("started_at") or ""),
+            ended_at=str(step.get("ended_at") or ""),
+            summary=str(step.get("summary") or ""),
+            input=_json_loads(step.get("input_json")),
+            output=output_payload,
+            error=error_payload if error_payload is not None else _step_error(output_payload, status),
+            pre_state=_json_loads(step.get("pre_state_json")),
+            post_state=_json_loads(step.get("post_state_json")),
+            tool_calls=tool_calls,
+            replayable=replay_disabled_reason is None,
+            replay_disabled_reason=replay_disabled_reason,
+        ),
+    )
+
+
+def _prepare_replay_context(
+    *,
+    run_id: str,
+    request: RunReplayRequest,
+) -> Dict[str, Any]:
+    source_run = db.read_run(run_id)
+    if not source_run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    diagnostics: List[ReplayDiagnostic] = []
+    workflow_version_id = str(source_run.get("workflow_version_id") or "").strip()
+    if not workflow_version_id:
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="WORKFLOW_VERSION_MISSING",
+                severity="error",
+                message="Run does not have a workflow_version_id and cannot be replayed.",
+                path="run.workflow_version_id",
+            )
+        )
+        return {
+            "diagnostics": diagnostics,
+            "source_run": source_run,
+            "version": None,
+            "from_step": None,
+            "fork_start_state": None,
+            "resume_node_id": None,
+        }
+
+    version = db.get_workflow_version(workflow_version_id)
+    if version is None:
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="WORKFLOW_VERSION_NOT_FOUND",
+                severity="error",
+                message="Referenced workflow version no longer exists.",
+                path="run.workflow_version_id",
+            )
+        )
+
+    from_step = db.get_step(run_id, request.from_step_id)
+    if from_step is None:
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="STEP_NOT_FOUND",
+                severity="error",
+                message=f"Step '{request.from_step_id}' was not found in this run.",
+                path="from_step_id",
+            )
+        )
+
+    if from_step is not None and not _is_success_step_status(from_step.get("status")):
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="STEP_NOT_REPLAYABLE",
+                severity="error",
+                message="Replay source step must be completed successfully.",
+                path="from_step_id",
+            )
+        )
+
+    if _has_replay_errors(diagnostics):
+        return {
+            "diagnostics": diagnostics,
+            "source_run": source_run,
+            "version": version,
+            "from_step": from_step,
+            "fork_start_state": None,
+            "resume_node_id": None,
+        }
+
+    base_source = "pre_state_json" if request.base_state == "pre" else "post_state_json"
+    base_state = _json_loads(from_step.get(base_source))
+    if not isinstance(base_state, dict):
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="BASE_STATE_MISSING",
+                severity="error",
+                message=f"Selected step is missing {request.base_state} state snapshot.",
+                path=base_source,
+            )
+        )
+        base_state = {}
+
+    ordered_steps = db.read_steps(run_id)
+    from_step_internal = db.parse_step_id(from_step.get("step_id"))
+    resume_node_id: Optional[str] = None
+    if bool(request.replay_this_step):
+        resume_node_id = _extract_resume_node(from_step)
+    else:
+        found_anchor = False
+        for candidate in ordered_steps:
+            candidate_internal = db.parse_step_id(candidate.get("step_id") or candidate.get("id"))
+            if from_step_internal is not None and candidate_internal == from_step_internal:
+                found_anchor = True
+                continue
+            if not found_anchor:
+                continue
+            maybe_node = _extract_resume_node(candidate)
+            if maybe_node:
+                resume_node_id = maybe_node
+                break
+    if not resume_node_id:
+        diagnostics.append(
+            ReplayDiagnostic(
+                code="RESUME_NODE_NOT_FOUND",
+                severity="error",
+                message="Unable to determine a resume node from the selected step.",
+                path="from_step_id",
+            )
+        )
+
+    fork_start_state, patch_diagnostics = _apply_state_patch(
+        base_state=base_state,
+        patch=request.state_patch,
+        patch_mode=request.patch_mode,
+    )
+    diagnostics.extend(patch_diagnostics)
+
+    workflow_spec = version.get("spec") if isinstance(version, dict) and isinstance(version.get("spec"), dict) else {}
+    diagnostics.extend(
+        _validate_state_schema(
+            state=fork_start_state,
+            workflow_spec=workflow_spec,
+        )
+    )
+    return {
+        "diagnostics": diagnostics,
+        "source_run": source_run,
+        "version": version,
+        "from_step": from_step,
+        "fork_start_state": fork_start_state if isinstance(fork_start_state, dict) else None,
+        "resume_node_id": resume_node_id,
+    }
+
+
+@app.post("/runs/{run_id}/replay/dry_run", response_model=RunReplayResponse)
+async def run_replay_dry_run(run_id: str, request: RunReplayRequest) -> RunReplayResponse:
+    prepared = _prepare_replay_context(run_id=run_id, request=request)
+    diagnostics = list(prepared.get("diagnostics") or [])
+    return RunReplayResponse(
+        new_run_id=None,
+        diagnostics=diagnostics,
+        fork_start_state=prepared.get("fork_start_state"),
+        resume_node_id=str(prepared.get("resume_node_id") or "") or None,
+    )
+
+
+@app.post("/runs/{run_id}/replay", response_model=RunReplayResponse)
+async def run_replay(run_id: str, request: RunReplayRequest) -> RunReplayResponse:
+    prepared = _prepare_replay_context(run_id=run_id, request=request)
+    diagnostics = list(prepared.get("diagnostics") or [])
+    if _has_replay_errors(diagnostics):
+        return RunReplayResponse(
+            new_run_id=None,
+            diagnostics=diagnostics,
+            fork_start_state=prepared.get("fork_start_state"),
+            resume_node_id=str(prepared.get("resume_node_id") or "") or None,
+        )
+
+    source_run = prepared.get("source_run") if isinstance(prepared.get("source_run"), dict) else {}
+    version = prepared.get("version") if isinstance(prepared.get("version"), dict) else {}
+    from_step = prepared.get("from_step") if isinstance(prepared.get("from_step"), dict) else {}
+    resume_node_id = str(prepared.get("resume_node_id") or "").strip()
+    fork_start_state = prepared.get("fork_start_state")
+    if not isinstance(fork_start_state, dict):
+        return RunReplayResponse(
+            new_run_id=None,
+            diagnostics=[
+                ReplayDiagnostic(
+                    code="FORK_STATE_INVALID",
+                    severity="error",
+                    message="Fork start state is invalid.",
+                    path="fork_start_state",
+                )
+            ],
+            fork_start_state=None,
+            resume_node_id=resume_node_id or None,
+        )
+
+    payload = _json_loads(source_run.get("payload_json"))
+    payload_obj = payload if isinstance(payload, dict) else {}
+    source_input = payload_obj.get("input")
+    run_input = dict(source_input) if isinstance(source_input, dict) else {}
+
+    workflow_info = version.get("workflow") if isinstance(version.get("workflow"), dict) else {}
+    compiled = version.get("compiled") if isinstance(version.get("compiled"), dict) else {}
+    runtime_graph = compiled.get("runtime_graph") if isinstance(compiled.get("runtime_graph"), dict) else {}
+    workflow_id = str(version.get("workflow_id") or "")
+    workflow_defs_override = [
+        {
+            "id": workflow_id,
+            "name": str(workflow_info.get("name") or workflow_id),
+            "title": str(workflow_info.get("name") or workflow_id),
+            "description": str(workflow_info.get("description") or ""),
+            "type": "custom",
+            "source": "custom",
+            "enabled": True,
+            "graph": runtime_graph,
+            "compiled": compiled,
+            "spec": dict(version.get("spec") or {}),
+        }
+    ]
+
+    replay_run_id = str(uuid.uuid4())
+    sandbox_mode = (
+        bool(request.sandbox)
+        if request.sandbox is not None
+        else bool(source_run.get("sandbox_mode"))
+    )
+    parent_step_id = db.format_step_id(from_step.get("step_id"))
+    fork_reason = "manual_state_edit" if bool(request.state_patch) else "replay"
+
+    if sandbox_mode:
+        def _tool_gate(payload: Dict[str, Any]) -> bool:
+            return _SANDBOX_APPROVALS.request_decision(
+                run_id=replay_run_id,
+                payload=payload,
+            )
+
+        def _run_async() -> None:
+            graph.run_workflow(
+                workflow_id=workflow_id,
+                input=run_input,
+                workflow_defs=workflow_defs_override,
+                run_id=replay_run_id,
+                workflow_version_id=str(version.get("version_id") or ""),
+                sandbox_mode=True,
+                tool_call_gate=_tool_gate,
+                initial_state=fork_start_state,
+                replay_mode=True,
+                resume_node_id=resume_node_id,
+                parent_run_id=run_id,
+                parent_step_id=parent_step_id,
+                forked_from_state_json=json.dumps(fork_start_state, default=str, ensure_ascii=True),
+                fork_patch_json=json.dumps(request.state_patch, default=str, ensure_ascii=True),
+                fork_reason=fork_reason,
+            )
+
+        threading.Thread(target=_run_async, daemon=True).start()
+        return RunReplayResponse(
+            new_run_id=replay_run_id,
+            diagnostics=diagnostics,
+            fork_start_state=fork_start_state,
+            resume_node_id=resume_node_id or None,
+        )
+
+    graph.run_workflow(
+        workflow_id=workflow_id,
+        input=run_input,
+        workflow_defs=workflow_defs_override,
+        run_id=replay_run_id,
+        workflow_version_id=str(version.get("version_id") or ""),
+        sandbox_mode=False,
+        initial_state=fork_start_state,
+        replay_mode=True,
+        resume_node_id=resume_node_id,
+        parent_run_id=run_id,
+        parent_step_id=parent_step_id,
+        forked_from_state_json=json.dumps(fork_start_state, default=str, ensure_ascii=True),
+        fork_patch_json=json.dumps(request.state_patch, default=str, ensure_ascii=True),
+        fork_reason=fork_reason,
+    )
+    return RunReplayResponse(
+        new_run_id=replay_run_id,
+        diagnostics=diagnostics,
+        fork_start_state=fork_start_state,
+        resume_node_id=resume_node_id or None,
+    )
+
+
+@app.get("/runs/{run_id}/pending_tool_calls", response_model=PendingToolCallsResponse)
+async def run_pending_tool_calls(run_id: str) -> PendingToolCallsResponse:
+    run_row = db.read_run(run_id)
+    if not run_row:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    pending_rows = db.list_pending_tool_calls(run_id)
+    pending: List[Dict[str, Any]] = []
+    for row in pending_rows:
+        args_payload = _json_loads(row.get("args_json"))
+        pending.append(
+            {
+                "tool_call_id": str(row.get("tool_call_id") or ""),
+                "run_id": str(row.get("run_id") or run_id),
+                "step_id": row.get("step_id"),
+                "tool_name": str(row.get("tool_name") or ""),
+                "args": args_payload if isinstance(args_payload, dict) else {},
+                "approved_bool": row.get("approved_bool"),
+                "started_at": str(row.get("started_at") or ""),
+                "status": str(row.get("status") or "pending"),
+            }
+        )
+    return PendingToolCallsResponse(run_id=run_id, pending=pending)
+
+
+@app.post(
+    "/runs/{run_id}/tool_calls/{tool_call_id}/approve",
+    response_model=ToolCallApprovalResponse,
+)
+async def approve_tool_call(
+    run_id: str,
+    tool_call_id: str,
+    request: ToolCallApprovalRequest,
+) -> ToolCallApprovalResponse:
+    success = _SANDBOX_APPROVALS.submit_decision(
+        run_id=run_id,
+        tool_call_id=tool_call_id,
+        approved=bool(request.approved),
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Pending tool call not found.")
+
+    return ToolCallApprovalResponse(
+        run_id=run_id,
+        tool_call_id=tool_call_id,
+        approved=bool(request.approved),
+        status="approved" if request.approved else "rejected",
+    )
 
 
 @app.get("/runs/{run_id}/state", response_model=RunStateResponse)

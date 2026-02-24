@@ -82,7 +82,9 @@ def get_vectorstore(
 
     resolved_url = str(url or os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL)).strip()
     if not resolved_url:
-        raise ValueError("QDRANT_URL must be a non-empty URL.")
+        raise ValueError(
+            "Qdrant URL is required (input.qdrant_url, context.qdrant_url, or QDRANT_URL)."
+        )
 
     vectorstore_class = _resolve_qdrant_vectorstore_class()
 
@@ -92,7 +94,8 @@ def get_vectorstore(
     except Exception as exc:
         raise RuntimeError(
             f"Unable to connect to Qdrant at '{resolved_url}'. "
-            "Set QDRANT_URL correctly and ensure Qdrant is running."
+            "Ensure embedded Qdrant is running and API runtime config is set "
+            "or provide qdrant_url explicitly."
         ) from exc
 
     try:
