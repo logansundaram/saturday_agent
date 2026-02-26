@@ -128,6 +128,7 @@ export default function WorkflowsPage() {
     void fetchWorkflows(true);
   }, [fetchWorkflows]);
 
+  ///update buttons are not necessary for now, maybe when builder is done
   useEffect(() => {
     const handler = () => {
       void fetchWorkflows(false);

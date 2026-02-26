@@ -89,6 +89,61 @@ def _sandbox_tool_spec(workflow_id: str, tool_id: str) -> dict:
     }
 
 
+def _llm_like_tool_spec(workflow_id: str, tool_id: str) -> dict:
+    return {
+        "workflow_id": workflow_id,
+        "name": "LLM-like Tool Workflow",
+        "description": "",
+        "allow_cycles": False,
+        "state_schema": [
+            {"key": "artifacts", "type": "json", "description": "", "required": False},
+            {"key": "answer", "type": "string", "description": "", "required": False},
+        ],
+        "nodes": [
+            {
+                "id": "build_messages",
+                "type": "tool",
+                "label": "Build Messages",
+                "reads": ["task"],
+                "writes": ["artifacts"],
+                "config": {
+                    "tool_name": tool_id,
+                    "args_map": {"query": "task"},
+                    "output_key": "artifacts",
+                },
+                "position": {"x": 120, "y": 120},
+            },
+            {
+                "id": "llm_answer",
+                "type": "tool",
+                "label": "LLM Answer",
+                "reads": ["task"],
+                "writes": ["artifacts"],
+                "config": {
+                    "tool_name": tool_id,
+                    "args_map": {"query": "task"},
+                    "output_key": "artifacts",
+                },
+                "position": {"x": 360, "y": 120},
+            },
+            {
+                "id": "finalize_1",
+                "type": "finalize",
+                "label": "Finalize",
+                "reads": ["task"],
+                "writes": ["answer"],
+                "config": {"response_template": "done {{task}}", "output_key": "answer"},
+                "position": {"x": 620, "y": 120},
+            },
+        ],
+        "edges": [
+            {"id": "edge_1", "from": "build_messages", "to": "llm_answer", "label": "always"},
+            {"id": "edge_2", "from": "llm_answer", "to": "finalize_1", "label": "always"},
+        ],
+        "metadata": {"enabled": True},
+    }
+
+
 def _seed_python_tool(tool_id: str) -> None:
     if db is None:
         raise RuntimeError("db module unavailable")
@@ -379,6 +434,294 @@ class WorkflowEndpointTests(unittest.TestCase):
         self.assertEqual(skipped_detail_resp.status_code, 200)
         skipped_detail = (skipped_detail_resp.json().get("step") or {})
         self.assertEqual(skipped_detail.get("pre_state"), skipped_detail.get("post_state"))
+
+    def test_rerun_from_state_rejects_invalid_step_index(self) -> None:
+        workflow_id = "workflow.custom.endpoint_rerun_invalid_index"
+        spec = _sandbox_tool_spec(workflow_id, "tool.custom.test_echo")
+        run_id = self._run_custom_workflow(workflow_id, spec, {"task": "rerun invalid index"})
+
+        rerun_resp = self.client.post(
+            f"/runs/{run_id}/rerun_from_state",
+            json={
+                "step_index": 9999,
+                "state_json": {},
+                "resume": "next",
+            },
+        )
+        self.assertEqual(rerun_resp.status_code, 200)
+        payload = rerun_resp.json()
+        self.assertIsNone(payload.get("new_run_id"))
+        diagnostics = payload.get("diagnostics") or []
+        self.assertTrue(any(item.get("code") == "STEP_INDEX_OUT_OF_RANGE" for item in diagnostics))
+
+    def test_rerun_from_state_creates_linked_run_with_same_workflow_version(self) -> None:
+        workflow_id = "workflow.custom.endpoint_rerun_linked"
+        spec = _sandbox_tool_spec(workflow_id, "tool.custom.test_echo")
+        run_id = self._run_custom_workflow(workflow_id, spec, {"task": "rerun linked"})
+        source_run_resp = self.client.get(f"/runs/{run_id}")
+        self.assertEqual(source_run_resp.status_code, 200)
+        source_run = source_run_resp.json()
+        source_version_id = str(source_run.get("workflow_version_id") or "")
+        self.assertTrue(source_version_id)
+
+        from_step = self._find_step(run_id, preferred_node_id="tool_1")
+        self.assertIsNotNone(from_step)
+        if from_step is None:
+            return
+        target_step_index = int(from_step.get("step_index") or -1)
+        self.assertGreaterEqual(target_step_index, 0)
+
+        state_resp = self.client.get(f"/runs/{run_id}/state")
+        self.assertEqual(state_resp.status_code, 200)
+        snapshots = state_resp.json().get("snapshots") or []
+        selected_state = None
+        for snapshot in snapshots:
+            try:
+                snapshot_step_index = int(snapshot.get("step_index"))
+            except Exception:
+                continue
+            if snapshot_step_index != target_step_index:
+                continue
+            if isinstance(snapshot.get("state"), dict):
+                selected_state = snapshot.get("state")
+                break
+        self.assertIsNotNone(selected_state)
+        if selected_state is None:
+            return
+
+        rerun_resp = self.client.post(
+            f"/runs/{run_id}/rerun_from_state",
+            json={
+                "step_index": target_step_index,
+                "state_json": selected_state,
+                "resume": "next",
+            },
+        )
+        self.assertEqual(rerun_resp.status_code, 200)
+        rerun_payload = rerun_resp.json()
+        new_run_id = str(rerun_payload.get("new_run_id") or "")
+        self.assertTrue(new_run_id)
+
+        rerun_detail_resp = self.client.get(f"/runs/{new_run_id}")
+        self.assertEqual(rerun_detail_resp.status_code, 200)
+        rerun_detail = rerun_detail_resp.json()
+        self.assertEqual(str(rerun_detail.get("parent_run_id") or ""), run_id)
+        self.assertEqual(str(rerun_detail.get("workflow_version_id") or ""), source_version_id)
+        self.assertEqual(str(rerun_detail.get("mode") or ""), "replay")
+        self.assertTrue(str(rerun_detail.get("parent_step_id") or ""))
+
+    def test_rerun_from_state_supports_missing_workflow_version_id(self) -> None:
+        workflow_id = "workflow.custom.endpoint_rerun_missing_version"
+        spec = _sandbox_tool_spec(workflow_id, "tool.custom.test_echo")
+        run_id = self._run_custom_workflow(workflow_id, spec, {"task": "rerun missing version"})
+        from_step = self._find_step(run_id, preferred_node_id="tool_1")
+        self.assertIsNotNone(from_step)
+        if from_step is None:
+            return
+        target_step_index = int(from_step.get("step_index") or -1)
+        self.assertGreaterEqual(target_step_index, 0)
+
+        state_resp = self.client.get(f"/runs/{run_id}/state")
+        self.assertEqual(state_resp.status_code, 200)
+        snapshots = state_resp.json().get("snapshots") or []
+        selected_state = None
+        for snapshot in snapshots:
+            try:
+                snapshot_step_index = int(snapshot.get("step_index"))
+            except Exception:
+                continue
+            if snapshot_step_index != target_step_index:
+                continue
+            if isinstance(snapshot.get("state"), dict):
+                selected_state = snapshot.get("state")
+                break
+        self.assertIsNotNone(selected_state)
+        if selected_state is None:
+            return
+
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute(
+                """
+                UPDATE runs
+                SET workflow_version_id = ''
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        rerun_resp = self.client.post(
+            f"/runs/{run_id}/rerun_from_state",
+            json={
+                "step_index": target_step_index,
+                "state_json": selected_state,
+                "resume": "next",
+            },
+        )
+        self.assertEqual(rerun_resp.status_code, 200)
+        rerun_payload = rerun_resp.json()
+        new_run_id = str(rerun_payload.get("new_run_id") or "")
+        self.assertTrue(new_run_id)
+        diagnostics = rerun_payload.get("diagnostics") or []
+        self.assertFalse(any(item.get("code") == "WORKFLOW_VERSION_MISSING" for item in diagnostics))
+
+        rerun_detail_resp = self.client.get(f"/runs/{new_run_id}")
+        self.assertEqual(rerun_detail_resp.status_code, 200)
+        rerun_detail = rerun_detail_resp.json()
+        self.assertEqual(str(rerun_detail.get("parent_run_id") or ""), run_id)
+        self.assertEqual(str(rerun_detail.get("mode") or ""), "replay")
+        self.assertTrue(str(rerun_detail.get("parent_step_id") or ""))
+
+    def test_rerun_from_state_terminal_next_falls_back_to_same_step(self) -> None:
+        workflow_id = "workflow.custom.endpoint_rerun_terminal_fallback"
+        spec = _finalize_only_spec(workflow_id)
+        run_id = self._run_custom_workflow(workflow_id, spec, {"task": "rerun terminal fallback"})
+
+        state_resp = self.client.get(f"/runs/{run_id}/state")
+        self.assertEqual(state_resp.status_code, 200)
+        snapshots = state_resp.json().get("snapshots") or []
+        self.assertGreaterEqual(len(snapshots), 1)
+        if len(snapshots) == 0:
+            return
+        selected_snapshot = snapshots[-1]
+        step_index = int(selected_snapshot.get("step_index") or -1)
+        self.assertGreaterEqual(step_index, 0)
+        selected_state = selected_snapshot.get("state")
+        self.assertIsInstance(selected_state, dict)
+        if not isinstance(selected_state, dict):
+            return
+
+        rerun_resp = self.client.post(
+            f"/runs/{run_id}/rerun_from_state",
+            json={
+                "step_index": step_index,
+                "state_json": selected_state,
+                "resume": "next",
+            },
+        )
+        self.assertEqual(rerun_resp.status_code, 200)
+        payload = rerun_resp.json()
+        new_run_id = str(payload.get("new_run_id") or "")
+        self.assertTrue(new_run_id)
+        diagnostics = payload.get("diagnostics") or []
+        self.assertFalse(any(item.get("code") == "RESUME_NODE_NOT_FOUND" for item in diagnostics))
+
+        rerun_detail_resp = self.client.get(f"/runs/{new_run_id}")
+        self.assertEqual(rerun_detail_resp.status_code, 200)
+        rerun_detail = rerun_detail_resp.json()
+        self.assertEqual(str(rerun_detail.get("parent_run_id") or ""), run_id)
+        self.assertEqual(str(rerun_detail.get("mode") or ""), "replay")
+        self.assertTrue(str(rerun_detail.get("parent_step_id") or ""))
+
+    def test_rerun_from_state_prompt_change_rewinds_pre_llm(self) -> None:
+        workflow_id = "workflow.custom.endpoint_rerun_prompt_rewind"
+        spec = _llm_like_tool_spec(workflow_id, "tool.custom.test_echo")
+        run_id = self._run_custom_workflow(workflow_id, spec, {"task": "original prompt"})
+
+        state_resp = self.client.get(f"/runs/{run_id}/state")
+        self.assertEqual(state_resp.status_code, 200)
+        snapshots = state_resp.json().get("snapshots") or []
+        self.assertGreaterEqual(len(snapshots), 1)
+        if len(snapshots) == 0:
+            return
+
+        selected_snapshot = snapshots[-1]
+        step_index = int(selected_snapshot.get("step_index") or -1)
+        self.assertGreaterEqual(step_index, 0)
+        selected_state = selected_snapshot.get("state")
+        self.assertIsInstance(selected_state, dict)
+        if not isinstance(selected_state, dict):
+            return
+
+        edited_state = dict(selected_state)
+        edited_state["task"] = "changed prompt"
+
+        rerun_resp = self.client.post(
+            f"/runs/{run_id}/rerun_from_state",
+            json={
+                "step_index": step_index,
+                "state_json": edited_state,
+                "resume": "next",
+            },
+        )
+        self.assertEqual(rerun_resp.status_code, 200)
+        payload = rerun_resp.json()
+        new_run_id = str(payload.get("new_run_id") or "")
+        self.assertTrue(new_run_id)
+        diagnostics = payload.get("diagnostics") or []
+        self.assertTrue(
+            any(item.get("code") == "PROMPT_CHANGE_REWIND_APPLIED" for item in diagnostics)
+        )
+
+        logs_resp = self.client.get(f"/runs/{new_run_id}/logs")
+        self.assertEqual(logs_resp.status_code, 200)
+        steps = logs_resp.json().get("steps") or []
+        llm_like_step = None
+        for step in steps:
+            node_id = str(step.get("node_id") or "")
+            name = str(step.get("name") or "")
+            if node_id == "llm_answer" or name.endswith("llm_answer"):
+                llm_like_step = step
+                break
+        self.assertIsNotNone(llm_like_step)
+        if llm_like_step is None:
+            return
+        self.assertNotEqual(str(llm_like_step.get("status") or ""), "skipped")
+
+    def test_rerun_from_state_no_prompt_change_keeps_selected_resume(self) -> None:
+        workflow_id = "workflow.custom.endpoint_rerun_prompt_unchanged"
+        spec = _llm_like_tool_spec(workflow_id, "tool.custom.test_echo")
+        run_id = self._run_custom_workflow(workflow_id, spec, {"task": "original prompt"})
+
+        state_resp = self.client.get(f"/runs/{run_id}/state")
+        self.assertEqual(state_resp.status_code, 200)
+        snapshots = state_resp.json().get("snapshots") or []
+        self.assertGreaterEqual(len(snapshots), 1)
+        if len(snapshots) == 0:
+            return
+
+        selected_snapshot = snapshots[-1]
+        step_index = int(selected_snapshot.get("step_index") or -1)
+        self.assertGreaterEqual(step_index, 0)
+        selected_state = selected_snapshot.get("state")
+        self.assertIsInstance(selected_state, dict)
+        if not isinstance(selected_state, dict):
+            return
+
+        rerun_resp = self.client.post(
+            f"/runs/{run_id}/rerun_from_state",
+            json={
+                "step_index": step_index,
+                "state_json": selected_state,
+                "resume": "next",
+            },
+        )
+        self.assertEqual(rerun_resp.status_code, 200)
+        payload = rerun_resp.json()
+        new_run_id = str(payload.get("new_run_id") or "")
+        self.assertTrue(new_run_id)
+        diagnostics = payload.get("diagnostics") or []
+        self.assertFalse(
+            any(item.get("code") == "PROMPT_CHANGE_REWIND_APPLIED" for item in diagnostics)
+        )
+
+        logs_resp = self.client.get(f"/runs/{new_run_id}/logs")
+        self.assertEqual(logs_resp.status_code, 200)
+        steps = logs_resp.json().get("steps") or []
+        llm_like_step = None
+        for step in steps:
+            node_id = str(step.get("node_id") or "")
+            name = str(step.get("name") or "")
+            if node_id == "llm_answer" or name.endswith("llm_answer"):
+                llm_like_step = step
+                break
+        self.assertIsNotNone(llm_like_step)
+        if llm_like_step is None:
+            return
+        self.assertEqual(str(llm_like_step.get("status") or ""), "skipped")
 
     def _wait_for_pending(self, run_id: str, timeout_s: float = 6.0) -> list[dict]:
         deadline = time.time() + timeout_s

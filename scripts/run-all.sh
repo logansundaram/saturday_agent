@@ -92,8 +92,16 @@ backend_has_required_routes() {
     fi
   done
 
-  # /chat/stream is POST-only; verify it exists in OpenAPI before reusing backend.
-  if ! curl -fsS --max-time 2 "http://${API_HOST}:${API_PORT}/openapi.json" | grep -q '"/chat/stream"'; then
+  # POST-only routes: verify they exist in OpenAPI before reusing backend.
+  local openapi_payload
+  openapi_payload="$(curl -fsS --max-time 2 "http://${API_HOST}:${API_PORT}/openapi.json" || true)"
+  if [[ -z "$openapi_payload" ]]; then
+    return 1
+  fi
+  if ! grep -q '"/chat/stream"' <<<"$openapi_payload"; then
+    return 1
+  fi
+  if ! grep -q '"/runs/{run_id}/rerun_from_state"' <<<"$openapi_payload"; then
     return 1
   fi
 

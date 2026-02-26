@@ -369,6 +369,16 @@ export type RunStepDetail = SharedRunStepDetail;
 export type ReplayRequest = SharedReplayRequest;
 export type ReplayResponse = SharedReplayResponse;
 export type ReplayDryRunResponse = SharedReplayDryRunResponse;
+export type RerunFromStateRequest = {
+  step_index: number;
+  state_json: Record<string, unknown>;
+  resume?: "next" | "same";
+  sandbox?: boolean | null;
+};
+export type RerunFromStateResponse = {
+  new_run_id: string | null;
+  diagnostics: ReplayResponse["diagnostics"];
+};
 
 type WorkflowsResponse = {
   workflows?: Workflow[];
@@ -825,6 +835,25 @@ export async function replayRun(
         ? payload.fork_start_state
         : null,
     resume_node_id: payload.resume_node_id ?? null,
+  };
+}
+
+export async function rerunFromState(
+  runId: string,
+  request: RerunFromStateRequest,
+  signal?: AbortSignal
+): Promise<RerunFromStateResponse> {
+  const payload = await fetchJson<{
+    new_run_id?: string | null;
+    diagnostics?: ReplayResponse["diagnostics"];
+  }>(`/runs/${encodeURIComponent(runId)}/rerun_from_state`, {
+    method: "POST",
+    body: JSON.stringify(request),
+    signal,
+  });
+  return {
+    new_run_id: payload.new_run_id ?? null,
+    diagnostics: Array.isArray(payload.diagnostics) ? payload.diagnostics : [],
   };
 }
 

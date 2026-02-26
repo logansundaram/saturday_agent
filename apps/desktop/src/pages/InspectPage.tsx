@@ -3,7 +3,21 @@ import StepList from "../components/inspect/StepList";
 import JsonView from "../components/inspect/JsonView";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import { getRun, getRunLogs, getRunState } from "../lib/api";
+import { Textarea } from "../components/ui/textarea";
+import {
+  buildRerunFromStateRequest,
+  hasRerunDiagnosticErrors,
+  normalizeRerunDiagnostics,
+  stringifyRerunStateForEditor,
+  type RerunDiagnostic,
+} from "../components/inspect/rerunFromState";
+import {
+  getRun,
+  getRunLogs,
+  getRunState,
+  replayRun,
+  rerunFromState,
+} from "../lib/api";
 import type { Run, RunSnapshot, Step } from "../lib/api";
 
 type InspectPageProps = {
@@ -112,6 +126,16 @@ function summarizeRunId(runId: string): string {
   return `${runId.slice(0, 10)}...${runId.slice(-6)}`;
 }
 
+function rerunDiagnosticTone(severity: string): string {
+  if (severity === "info") {
+    return "border-sky-400/30 bg-sky-500/10 text-sky-100";
+  }
+  if (severity === "warning") {
+    return "border-amber-400/30 bg-amber-500/10 text-amber-100";
+  }
+  return "border-rose-400/30 bg-rose-500/10 text-rose-100";
+}
+
 export default function InspectPage({ runId, onBack }: InspectPageProps) {
   const [run, setRun] = useState<Run | null>(null);
   const [steps, setSteps] = useState<Step[]>([]);
@@ -122,6 +146,11 @@ export default function InspectPage({ runId, onBack }: InspectPageProps) {
   const [activeTab, setActiveTab] = useState<InspectTab>("step");
   const [selectedStepIndex, setSelectedStepIndex] = useState<number>(0);
   const [selectedSnapshotIndex, setSelectedSnapshotIndex] = useState<number>(0);
+  const [rerunModalOpen, setRerunModalOpen] = useState<boolean>(false);
+  const [rerunEditorText, setRerunEditorText] = useState<string>("{}");
+  const [rerunDiagnostics, setRerunDiagnostics] = useState<RerunDiagnostic[]>([]);
+  const [rerunRunning, setRerunRunning] = useState<boolean>(false);
+  const [rerunToast, setRerunToast] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
     if (!runId) {
@@ -166,8 +195,52 @@ export default function InspectPage({ runId, onBack }: InspectPageProps) {
     void loadData();
   }, [loadData]);
 
+  useEffect(() => {
+    if (!rerunToast) {
+      return;
+    }
+    const timerId = window.setTimeout(() => {
+      setRerunToast(null);
+    }, 2500);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [rerunToast]);
+
+  useEffect(() => {
+    setRerunModalOpen(false);
+    setRerunEditorText("{}");
+    setRerunDiagnostics([]);
+    setRerunRunning(false);
+  }, [runId]);
+
   const selectedStep = steps[selectedStepIndex];
   const selectedSnapshot = snapshots[selectedSnapshotIndex];
+  const maxStepIndex = useMemo(() => {
+    if (steps.length === 0) {
+      return -1;
+    }
+    return steps.reduce((highest, item) => {
+      return Math.max(highest, item.step_index);
+    }, -1);
+  }, [steps]);
+  const selectedSnapshotIsTerminal =
+    Boolean(selectedSnapshot) &&
+    selectedSnapshot.step_index >= maxStepIndex &&
+    maxStepIndex >= 0;
+  const rerunDraft = useMemo(() => {
+    if (!selectedSnapshot) {
+      return {
+        request: null,
+        parseError: "No snapshot selected.",
+      };
+    }
+    return buildRerunFromStateRequest({
+      stepIndex: selectedSnapshot.step_index,
+      editorText: rerunEditorText,
+      resume: selectedSnapshotIsTerminal ? "same" : "next",
+    });
+  }, [selectedSnapshot, rerunEditorText, selectedSnapshotIsTerminal]);
 
   const toolEntries = useMemo(() => {
     if (selectedStep) {
@@ -181,6 +254,8 @@ export default function InspectPage({ runId, onBack }: InspectPageProps) {
 
   const runStatus = String(run?.status ?? "").toLowerCase() === "ok" ? "ok" : "error";
   const toolIds = Array.isArray(run?.tool_ids) ? run.tool_ids : [];
+  const rerunParseError = rerunDraft.parseError;
+  const rerunHasErrors = hasRerunDiagnosticErrors(rerunDiagnostics);
 
   const copyRunId = async () => {
     try {
@@ -189,6 +264,165 @@ export default function InspectPage({ runId, onBack }: InspectPageProps) {
       // Non-blocking if clipboard access is unavailable.
     }
   };
+
+  const openRerunModal = useCallback(() => {
+    if (!selectedSnapshot) {
+      return;
+    }
+    setRerunEditorText(stringifyRerunStateForEditor(selectedSnapshot.state, "{}"));
+    setRerunDiagnostics([]);
+    setRerunModalOpen(true);
+  }, [selectedSnapshot]);
+
+  const closeRerunModal = useCallback(() => {
+    if (rerunRunning) {
+      return;
+    }
+    setRerunModalOpen(false);
+    setRerunDiagnostics([]);
+  }, [rerunRunning]);
+
+  const validateRerunPayload = useCallback(() => {
+    if (rerunParseError) {
+      setRerunDiagnostics(
+        normalizeRerunDiagnostics([
+          {
+            code: "JSON_PARSE_ERROR",
+            severity: "error",
+            message: rerunParseError,
+            path: "state_json",
+          },
+        ])
+      );
+      return;
+    }
+    setRerunDiagnostics([
+      {
+        code: "JSON_VALID",
+        severity: "info",
+        message: "JSON is valid.",
+      },
+    ]);
+  }, [rerunParseError]);
+
+  const runRerunFromState = useCallback(async () => {
+    if (!runId || !rerunDraft.request) {
+      return;
+    }
+    setRerunRunning(true);
+    try {
+      const response = await rerunFromState(runId, rerunDraft.request);
+      const normalizedDiagnostics = normalizeRerunDiagnostics(response.diagnostics);
+      setRerunDiagnostics(normalizedDiagnostics);
+      if (hasRerunDiagnosticErrors(normalizedDiagnostics) || !response.new_run_id) {
+        return;
+      }
+      setRerunModalOpen(false);
+      setRerunDiagnostics([]);
+      setRerunToast(`Rerun started: ${summarizeRunId(response.new_run_id)}`);
+      window.dispatchEvent(
+        new CustomEvent("dashboard:navigate", {
+          detail: {
+            page: "chat",
+            runId: response.new_run_id,
+            sourceRunId: runId,
+            origin: "rerun_from_state",
+          },
+        })
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to rerun from selected state.";
+      if (message.includes("(404)")) {
+        const fallbackStep = steps.find((item) => {
+          if (!selectedSnapshot) {
+            return false;
+          }
+          if (item.step_index !== selectedSnapshot.step_index) {
+            return false;
+          }
+          return typeof item.step_id === "string" && item.step_id.trim().length > 0;
+        });
+
+        if (!fallbackStep?.step_id) {
+          setRerunDiagnostics(
+            normalizeRerunDiagnostics([
+              {
+                code: "STEP_LOOKUP_FAILED",
+                severity: "error",
+                message:
+                  "Backend rerun endpoint is unavailable and no matching step id was found for fallback replay.",
+                path: "step_index",
+              },
+            ])
+          );
+          return;
+        }
+
+        try {
+          const replayResponse = await replayRun(runId, {
+            from_step_id: fallbackStep.step_id,
+            state_patch: rerunDraft.request.state_json,
+            patch_mode: "replace",
+            base_state: "post",
+            replay_this_step: selectedSnapshotIsTerminal,
+          });
+          const replayDiagnostics = normalizeRerunDiagnostics(
+            replayResponse.diagnostics
+          );
+          setRerunDiagnostics(replayDiagnostics);
+          if (
+            hasRerunDiagnosticErrors(replayDiagnostics) ||
+            !replayResponse.new_run_id
+          ) {
+            return;
+          }
+          setRerunModalOpen(false);
+          setRerunDiagnostics([]);
+          setRerunToast(
+            `Rerun started: ${summarizeRunId(replayResponse.new_run_id)}`
+          );
+          window.dispatchEvent(
+            new CustomEvent("dashboard:navigate", {
+              detail: {
+                page: "chat",
+                runId: replayResponse.new_run_id,
+                sourceRunId: runId,
+                origin: "rerun_from_state",
+              },
+            })
+          );
+          return;
+        } catch (fallbackError) {
+          const fallbackMessage =
+            fallbackError instanceof Error
+              ? fallbackError.message
+              : "Fallback replay request failed.";
+          setRerunDiagnostics(
+            normalizeRerunDiagnostics([
+              {
+                code: "REQUEST_FAILED",
+                severity: "error",
+                message: fallbackMessage,
+              },
+            ])
+          );
+          return;
+        }
+      }
+      setRerunDiagnostics(
+        normalizeRerunDiagnostics([
+          {
+            code: "REQUEST_FAILED",
+            severity: "error",
+            message,
+          },
+        ])
+      );
+    } finally {
+      setRerunRunning(false);
+    }
+  }, [runId, rerunDraft.request, selectedSnapshot, selectedSnapshotIsTerminal, steps]);
 
   if (!runId) {
     return (
@@ -460,6 +694,15 @@ export default function InspectPage({ runId, onBack }: InspectPageProps) {
                       <div className="mt-2 text-[11px] text-secondary">
                         {selectedSnapshot?.timestamp || ""}
                       </div>
+                      <div className="mt-3 flex justify-end">
+                        <Button
+                          type="button"
+                          className="h-7 rounded-full border border-subtle bg-transparent px-3 text-xs text-secondary hover:text-primary"
+                          onClick={openRerunModal}
+                        >
+                          Edit state & rerun
+                        </Button>
+                      </div>
                     </div>
                     {stateDerived ? (
                       <div className="rounded-xl border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
@@ -474,6 +717,110 @@ export default function InspectPage({ runId, onBack }: InspectPageProps) {
           </div>
         )}
       </div>
+
+      {rerunToast ? (
+        <div className="fixed right-6 top-6 z-40 rounded-xl border border-emerald-400/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-100 shadow-lg">
+          {rerunToast}
+        </div>
+      ) : null}
+
+      {rerunModalOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6">
+          <div className="w-full max-w-4xl rounded-2xl border border-subtle bg-[#0b0b10] p-5 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base text-primary">Edit state & rerun</h2>
+                <p className="mt-1 text-xs text-secondary">
+                  Step #{selectedSnapshot?.step_index ?? "-"} ·{" "}
+                  {selectedSnapshotIsTerminal
+                    ? "resume from selected step"
+                    : "resume from next step"}
+                </p>
+              </div>
+              <Button
+                type="button"
+                className="h-8 rounded-full border border-subtle bg-transparent px-3 text-xs text-secondary hover:text-primary"
+                onClick={closeRerunModal}
+                disabled={rerunRunning}
+              >
+                Close
+              </Button>
+            </div>
+
+            <Textarea
+              value={rerunEditorText}
+              onChange={(event) => {
+                setRerunEditorText(event.target.value);
+                if (rerunDiagnostics.length > 0) {
+                  setRerunDiagnostics([]);
+                }
+              }}
+              className="min-h-[18rem] max-h-[60vh] font-mono text-xs leading-5"
+              spellCheck={false}
+            />
+
+            {rerunParseError ? (
+              <div className="mt-3 rounded-xl border border-rose-400/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
+                {rerunParseError}
+              </div>
+            ) : null}
+
+            {rerunDiagnostics.length > 0 ? (
+              <div className="mt-3 space-y-2">
+                {rerunDiagnostics.map((diagnostic, index) => (
+                  <div
+                    key={`${diagnostic.code}:${diagnostic.path ?? ""}:${index}`}
+                    className={
+                      "rounded-xl border px-3 py-2 text-xs " +
+                      rerunDiagnosticTone(diagnostic.severity)
+                    }
+                  >
+                    <div className="font-medium">{diagnostic.code}</div>
+                    <div>{diagnostic.message}</div>
+                    {diagnostic.path ? (
+                      <div className="mt-1 text-[11px] opacity-80">
+                        Path: {diagnostic.path}
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            <div className="mt-4 flex flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                className="h-8 rounded-full border border-subtle bg-transparent px-4 text-xs text-secondary hover:text-primary"
+                onClick={closeRerunModal}
+                disabled={rerunRunning}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                className="h-8 rounded-full border border-subtle bg-transparent px-4 text-xs text-secondary hover:text-primary"
+                onClick={validateRerunPayload}
+                disabled={rerunRunning}
+              >
+                Validate
+              </Button>
+              <Button
+                type="button"
+                className="h-8 rounded-full border border-gold/40 bg-gold/10 px-4 text-xs text-gold hover:bg-gold/20"
+                onClick={() => void runRerunFromState()}
+                disabled={!rerunDraft.request || Boolean(rerunParseError) || rerunRunning}
+              >
+                {rerunRunning ? "Rerunning..." : "Rerun from here"}
+              </Button>
+            </div>
+            {rerunHasErrors ? (
+              <div className="mt-3 text-[11px] text-secondary">
+                Fix validation errors above before rerunning.
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

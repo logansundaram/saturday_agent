@@ -26,6 +26,13 @@ export type ChatStoreState = {
   activeThreadId: string;
 };
 
+export type ChatMessagePatch = Partial<
+  Pick<
+    ChatMessage,
+    "content" | "runId" | "workflowId" | "modelId" | "toolIds" | "artifactIds"
+  >
+>;
+
 const STORAGE_KEY = "saturday.chat.history.v1";
 export const NEW_CHAT_TITLE = "New Chat";
 
@@ -296,6 +303,64 @@ export function appendMessage(threadId: string, message: ChatMessage): void {
     const thread = state.threads.find((item) => item.id === threadId);
     if (thread) {
       thread.updatedAt = now;
+    }
+    state.activeThreadId = threadId;
+  });
+}
+
+export function updateMessage(
+  threadId: string,
+  messageId: string,
+  patch: ChatMessagePatch
+): void {
+  if (!threadId || !messageId) {
+    return;
+  }
+
+  mutateState((state) => {
+    const current = state.messagesByThread[threadId];
+    if (!Array.isArray(current) || current.length === 0) {
+      return;
+    }
+
+    const messageIndex = current.findIndex((item) => item.id === messageId);
+    if (messageIndex < 0) {
+      return;
+    }
+
+    const existing = current[messageIndex];
+    const next: ChatMessage = {
+      ...existing,
+      content:
+        typeof patch.content === "string" ? patch.content : existing.content,
+      runId: typeof patch.runId === "string" ? patch.runId : existing.runId,
+      workflowId:
+        typeof patch.workflowId === "string"
+          ? patch.workflowId
+          : existing.workflowId,
+      modelId:
+        typeof patch.modelId === "string" ? patch.modelId : existing.modelId,
+      toolIds:
+        patch.toolIds === undefined
+          ? existing.toolIds
+          : isStringArray(patch.toolIds)
+          ? patch.toolIds
+          : undefined,
+      artifactIds:
+        patch.artifactIds === undefined
+          ? existing.artifactIds
+          : isStringArray(patch.artifactIds)
+          ? patch.artifactIds
+          : undefined,
+    };
+
+    const nextMessages = [...current];
+    nextMessages[messageIndex] = next;
+    state.messagesByThread[threadId] = nextMessages;
+
+    const thread = state.threads.find((item) => item.id === threadId);
+    if (thread) {
+      thread.updatedAt = Date.now();
     }
     state.activeThreadId = threadId;
   });

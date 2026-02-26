@@ -11,6 +11,8 @@ import { Textarea } from "../components/ui/textarea";
 import {
   API_BASE_URL,
   chatRunStream,
+  getRun,
+  getRunLogs,
   getModels,
   getTools,
   getVisionModels,
@@ -21,6 +23,8 @@ import type {
   ChatRunStreamEvent,
   ChatRunTimelineStep,
   Model,
+  Run,
+  RunLogs,
   Tool,
   Workflow,
 } from "../lib/api";
@@ -32,6 +36,7 @@ import {
   loadState,
   renameThread,
   setActiveThread,
+  updateMessage,
   type ChatMessage,
   type ChatStoreState,
   type ChatThread,
@@ -41,6 +46,17 @@ import {
   setChatRunMeta,
   type ChatRunMetaMap,
 } from "../lib/chatRunMetaStore";
+import {
+  extractRerunOutputText,
+  extractRerunPromptCandidate,
+  isTerminalRunStatus,
+  latestUserMessageText,
+  mapRunLogStepsToTimeline,
+  normalizePromptText,
+  resolveRerunTargetThreadId,
+  resolveSourcePromptUserMessageId,
+  toRunMetaStatus,
+} from "../components/chat/rerunIngestion";
 
 const MAX_TEXTAREA_HEIGHT = 160;
 const VISION_TOOL_ID = "vision.analyze";
@@ -113,6 +129,14 @@ const deriveThreadTitle = (text: string): string => {
 };
 
 const ANSWER_STEP_NAMES = new Set(["llm_answer", "llm_execute", "llm_synthesize"]);
+const RERUN_POLL_INTERVAL_MS = 750;
+const RERUN_TIMEOUT_MS = 120_000;
+
+const wait = (durationMs: number): Promise<void> => {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, durationMs);
+  });
+};
 
 type PendingAssistantMessage = {
   messageId: string;
@@ -127,6 +151,13 @@ type PendingAssistantMessage = {
   artifactIds?: string[];
   steps: ChatRunTimelineStep[];
   answerAttemptCount: number;
+};
+
+export type IncomingChatRerun = {
+  runId: string;
+  sourceRunId?: string;
+  origin?: "rerun_from_state" | string;
+  nonce: string;
 };
 
 const sortTimelineSteps = (steps: ChatRunTimelineStep[]): ChatRunTimelineStep[] =>
@@ -162,9 +193,15 @@ const upsertTimelineStep = (
 
 type ChatPageProps = {
   onInspectRun?: (runId: string) => void;
+  incomingRerun?: IncomingChatRerun | null;
+  onIncomingRerunHandled?: (nonce: string) => void;
 };
 
-export default function ChatPage({ onInspectRun }: ChatPageProps) {
+export default function ChatPage({
+  onInspectRun,
+  incomingRerun,
+  onIncomingRerunHandled,
+}: ChatPageProps) {
   const [chatState, setChatState] = useState<ChatStoreState>(() => loadState());
   const [runMetaByMessageId, setRunMetaByMessageId] = useState<ChatRunMetaMap>(() =>
     loadChatRunMetaMap()
@@ -175,6 +212,7 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
     null
   );
   const [autoScroll, setAutoScroll] = useState<boolean>(true);
+  const [queuedRerun, setQueuedRerun] = useState<IncomingChatRerun | null>(null);
 
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [models, setModels] = useState<Model[]>([]);
@@ -206,6 +244,8 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const dragDepthRef = useRef<number>(0);
+  const rerunHandledKeysRef = useRef<Set<string>>(new Set());
+  const rerunPollRef = useRef<{ cancelled: boolean } | null>(null);
 
   const backendReady =
     !optionsLoading &&
@@ -498,6 +538,271 @@ export default function ChatPage({ onInspectRun }: ChatPageProps) {
       window.removeEventListener("workflows:updated", handler);
     };
   }, []);
+
+  useEffect(() => {
+    if (!incomingRerun?.runId) {
+      return;
+    }
+    const runId = incomingRerun.runId.trim();
+    if (!runId) {
+      return;
+    }
+    const key = `${incomingRerun.nonce}:${runId}`;
+    if (rerunHandledKeysRef.current.has(key)) {
+      return;
+    }
+    rerunHandledKeysRef.current.add(key);
+    setQueuedRerun({
+      ...incomingRerun,
+      runId,
+    });
+    onIncomingRerunHandled?.(incomingRerun.nonce);
+  }, [incomingRerun, onIncomingRerunHandled]);
+
+  useEffect(() => {
+    if (!queuedRerun?.runId) {
+      return;
+    }
+
+    if (rerunPollRef.current) {
+      rerunPollRef.current.cancelled = true;
+    }
+    const pollRef = { cancelled: false };
+    rerunPollRef.current = pollRef;
+
+    const rerunRunId = queuedRerun.runId.trim();
+    const sourceRunId = queuedRerun.sourceRunId;
+    const queuedNonce = queuedRerun.nonce;
+
+    const processRerun = async () => {
+      const initialChatState = loadState();
+      const latestRunMetaMap = loadChatRunMetaMap();
+      let targetThreadId = resolveRerunTargetThreadId({
+        chatState: initialChatState,
+        runMetaByMessageId: latestRunMetaMap,
+        sourceRunId,
+      });
+
+      if (!targetThreadId) {
+        targetThreadId = createThread();
+      } else {
+        setActiveThread(targetThreadId);
+      }
+
+      if (pollRef.cancelled) {
+        return;
+      }
+
+      setAutoScroll(true);
+      refreshChatState();
+
+      let initialRun: Run;
+      try {
+        initialRun = await getRun(rerunRunId);
+      } catch (error) {
+        if (pollRef.cancelled) {
+          return;
+        }
+        const message =
+          error instanceof Error ? error.message : "Unable to load rerun.";
+        appendMessage(targetThreadId, {
+          id: createId(),
+          role: "assistant",
+          content: `Error: ${message}`,
+          createdAt: Date.now(),
+          runId: rerunRunId,
+        });
+        refreshChatState();
+        return;
+      }
+
+      if (pollRef.cancelled) {
+        return;
+      }
+
+      const threadState = loadState();
+      const threadMessages = threadState.messagesByThread[targetThreadId] ?? [];
+      const promptCandidate = normalizePromptText(extractRerunPromptCandidate(initialRun));
+      const sourcePromptMessageId = resolveSourcePromptUserMessageId({
+        messages: threadMessages,
+        runMetaByMessageId: latestRunMetaMap,
+        sourceRunId,
+      });
+
+      if (promptCandidate) {
+        if (sourcePromptMessageId) {
+          const sourcePromptMessage = threadMessages.find(
+            (message) => message.id === sourcePromptMessageId
+          );
+          const sourcePromptText = normalizePromptText(
+            sourcePromptMessage?.content || ""
+          );
+          if (promptCandidate !== sourcePromptText) {
+            updateMessage(targetThreadId, sourcePromptMessageId, {
+              content: promptCandidate,
+            });
+          }
+        } else {
+          const latestPrompt = normalizePromptText(
+            latestUserMessageText(threadMessages)
+          );
+          if (promptCandidate !== latestPrompt) {
+            appendMessage(targetThreadId, {
+              id: createId(),
+              role: "user",
+              content: promptCandidate,
+              createdAt: Date.now(),
+              workflowId: initialRun.workflow_id || undefined,
+              modelId: initialRun.model_id || undefined,
+              toolIds: Array.isArray(initialRun.tool_ids)
+                ? initialRun.tool_ids.map((toolId) => String(toolId))
+                : undefined,
+            });
+          }
+        }
+      }
+
+      const assistantMessageId = createId();
+      appendMessage(targetThreadId, {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "Re-running from Inspect...",
+        createdAt: Date.now(),
+        runId: rerunRunId,
+        workflowId: initialRun.workflow_id || undefined,
+        modelId: initialRun.model_id || undefined,
+        toolIds: Array.isArray(initialRun.tool_ids)
+          ? initialRun.tool_ids.map((toolId) => String(toolId))
+          : undefined,
+      });
+
+      const initialMeta = setChatRunMeta(assistantMessageId, {
+        runId: rerunRunId,
+        status: "running",
+        steps: [],
+        workflowId: initialRun.workflow_id || undefined,
+        modelId: initialRun.model_id || undefined,
+        toolIds: Array.isArray(initialRun.tool_ids)
+          ? initialRun.tool_ids.map((toolId) => String(toolId))
+          : undefined,
+      });
+      setRunMetaByMessageId(initialMeta);
+      refreshChatState();
+
+      const startedAtMs = Date.now();
+      while (!pollRef.cancelled) {
+        let runSnapshot: Run;
+        let logsSnapshot: RunLogs;
+        try {
+          [runSnapshot, logsSnapshot] = await Promise.all([
+            getRun(rerunRunId),
+            getRunLogs(rerunRunId),
+          ]);
+        } catch (error) {
+          if (Date.now() - startedAtMs >= RERUN_TIMEOUT_MS) {
+            if (pollRef.cancelled) {
+              return;
+            }
+            const message =
+              error instanceof Error
+                ? error.message
+                : "Timed out waiting for rerun status.";
+            updateMessage(targetThreadId, assistantMessageId, {
+              content: `Error: ${message}`,
+              runId: rerunRunId,
+            });
+            const timeoutMeta = setChatRunMeta(assistantMessageId, {
+              runId: rerunRunId,
+              status: "error",
+              endedAt: new Date().toISOString(),
+              steps: [],
+            });
+            setRunMetaByMessageId(timeoutMeta);
+            refreshChatState();
+            return;
+          }
+          await wait(RERUN_POLL_INTERVAL_MS);
+          continue;
+        }
+
+        if (pollRef.cancelled) {
+          return;
+        }
+
+        const timelineSteps = mapRunLogStepsToTimeline(logsSnapshot.steps);
+        const runStatus = String(runSnapshot.status || "").trim().toLowerCase();
+        const terminal = isTerminalRunStatus(runStatus);
+        const metaStatus = terminal ? toRunMetaStatus(runStatus) : "running";
+        const toolIds = Array.isArray(runSnapshot.tool_ids)
+          ? runSnapshot.tool_ids.map((toolId) => String(toolId))
+          : undefined;
+
+        const nextMeta = setChatRunMeta(assistantMessageId, {
+          runId: rerunRunId,
+          status: metaStatus,
+          endedAt: terminal
+            ? runSnapshot.ended_at || new Date().toISOString()
+            : undefined,
+          steps: timelineSteps,
+          workflowId: runSnapshot.workflow_id || undefined,
+          modelId: runSnapshot.model_id || undefined,
+          toolIds,
+        });
+        setRunMetaByMessageId(nextMeta);
+
+        if (terminal) {
+          const outputText = extractRerunOutputText(runSnapshot);
+          updateMessage(targetThreadId, assistantMessageId, {
+            content:
+              outputText ||
+              (metaStatus === "error"
+                ? "Error: Workflow execution failed."
+                : "Run completed."),
+            runId: rerunRunId,
+            workflowId: runSnapshot.workflow_id || undefined,
+            modelId: runSnapshot.model_id || undefined,
+            toolIds,
+          });
+          refreshChatState();
+          return;
+        }
+
+        if (Date.now() - startedAtMs >= RERUN_TIMEOUT_MS) {
+          updateMessage(targetThreadId, assistantMessageId, {
+            content: "Error: Timed out waiting for rerun completion.",
+            runId: rerunRunId,
+          });
+          const timeoutMeta = setChatRunMeta(assistantMessageId, {
+            runId: rerunRunId,
+            status: "error",
+            endedAt: new Date().toISOString(),
+            steps: timelineSteps,
+            workflowId: runSnapshot.workflow_id || undefined,
+            modelId: runSnapshot.model_id || undefined,
+            toolIds,
+          });
+          setRunMetaByMessageId(timeoutMeta);
+          refreshChatState();
+          return;
+        }
+
+        await wait(RERUN_POLL_INTERVAL_MS);
+      }
+    };
+
+    void processRerun().finally(() => {
+      setQueuedRerun((current) =>
+        current && current.nonce === queuedNonce ? null : current
+      );
+    });
+
+    return () => {
+      pollRef.cancelled = true;
+      if (rerunPollRef.current === pollRef) {
+        rerunPollRef.current = null;
+      }
+    };
+  }, [queuedRerun, refreshChatState]);
 
   const uploadFiles = useCallback(async (files: File[]) => {
     const imageFiles = toImageFiles(files);

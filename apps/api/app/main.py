@@ -12,7 +12,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -404,6 +404,18 @@ class RunReplayResponse(BaseModel):
     diagnostics: List[ReplayDiagnostic] = Field(default_factory=list)
     fork_start_state: Optional[Dict[str, Any]] = None
     resume_node_id: Optional[str] = None
+
+
+class RunRerunFromStateRequest(BaseModel):
+    step_index: int
+    state_json: Dict[str, Any] = Field(default_factory=dict)
+    resume: Literal["next", "same"] = "next"
+    sandbox: Optional[bool] = None
+
+
+class RunRerunFromStateResponse(BaseModel):
+    new_run_id: Optional[str] = None
+    diagnostics: List[ReplayDiagnostic] = Field(default_factory=list)
 
 
 class PendingToolCallsResponse(BaseModel):
@@ -2461,6 +2473,205 @@ def _prepare_replay_context(
     }
 
 
+def _resolve_step_id_by_index(run_id: str, step_index: int) -> Optional[str]:
+    target_step_index = int(step_index)
+    for row in db.read_steps(run_id):
+        candidate_raw = row.get("step_index")
+        if candidate_raw is None:
+            continue
+        try:
+            candidate_step_index = int(candidate_raw)
+        except (TypeError, ValueError):
+            continue
+        if candidate_step_index != target_step_index:
+            continue
+        step_id_value = row.get("step_id")
+        if step_id_value is None:
+            step_id_value = row.get("id")
+        resolved = db.format_step_id(step_id_value)
+        if resolved:
+            return resolved
+    return None
+
+
+_PROMPT_EDIT_KEYS: Tuple[str, ...] = ("task", "message", "messages")
+_LLM_STEP_HINTS: Tuple[str, ...] = ("llm", "build_messages")
+_KNOWN_LLM_STEP_NAMES: Set[str] = {
+    "llm_answer",
+    "llm_execute",
+    "llm_synthesize",
+    "build_messages",
+}
+
+
+def _canonical_json(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    except Exception:
+        return str(value)
+
+
+def _did_prompt_fields_change(
+    *,
+    original_state: Dict[str, Any],
+    edited_state: Dict[str, Any],
+) -> bool:
+    for key in _PROMPT_EDIT_KEYS:
+        if _canonical_json(original_state.get(key)) != _canonical_json(edited_state.get(key)):
+            return True
+    return False
+
+
+def _step_sort_key(step: Dict[str, Any]) -> Tuple[int, int]:
+    step_index_raw = step.get("step_index")
+    try:
+        step_index = int(step_index_raw)
+    except (TypeError, ValueError):
+        step_index = 10**9
+
+    internal_step_id = db.parse_step_id(step.get("step_id") or step.get("id"))
+    if internal_step_id is None:
+        internal_step_id = 10**9
+    return (step_index, int(internal_step_id))
+
+
+def _is_llm_related_step(step: Dict[str, Any]) -> bool:
+    node_id = str(step.get("node_id") or "").strip().lower()
+    node_type = str(step.get("node_type") or "").strip().lower()
+    name = str(step.get("name") or "").strip().lower()
+
+    if node_type == "llm":
+        return True
+    if name in _KNOWN_LLM_STEP_NAMES or node_id in _KNOWN_LLM_STEP_NAMES:
+        return True
+    return any(hint in node_id or hint in name for hint in _LLM_STEP_HINTS)
+
+
+def _find_previous_successful_step_id(
+    ordered_steps: List[Dict[str, Any]],
+    before_index: int,
+) -> Optional[str]:
+    for pointer in range(before_index - 1, -1, -1):
+        candidate = ordered_steps[pointer]
+        if not _is_success_step_status(candidate.get("status")):
+            continue
+        step_id_value = candidate.get("step_id")
+        if step_id_value is None:
+            step_id_value = candidate.get("id")
+        resolved = db.format_step_id(step_id_value)
+        if resolved:
+            return resolved
+    return None
+
+
+def _resolve_prompt_rewind_anchor_step_id(run_id: str) -> Optional[str]:
+    ordered_steps = sorted(db.read_steps(run_id), key=_step_sort_key)
+    if not ordered_steps:
+        return None
+
+    for index, step in enumerate(ordered_steps):
+        if not _is_llm_related_step(step):
+            continue
+        previous_step_id = _find_previous_successful_step_id(ordered_steps, index)
+        if previous_step_id:
+            return previous_step_id
+        break
+
+    for index, step in enumerate(ordered_steps):
+        if str(step.get("node_type") or "").strip().lower() == "system":
+            continue
+        if not _is_success_step_status(step.get("status")):
+            continue
+        previous_step_id = _find_previous_successful_step_id(ordered_steps, index)
+        if previous_step_id:
+            return previous_step_id
+        break
+
+    first_step = ordered_steps[0]
+    if _is_success_step_status(first_step.get("status")):
+        first_step_id = first_step.get("step_id")
+        if first_step_id is None:
+            first_step_id = first_step.get("id")
+        resolved = db.format_step_id(first_step_id)
+        if resolved:
+            return resolved
+
+    for step in ordered_steps:
+        if not _is_success_step_status(step.get("status")):
+            continue
+        step_id_value = step.get("step_id")
+        if step_id_value is None:
+            step_id_value = step.get("id")
+        resolved = db.format_step_id(step_id_value)
+        if resolved:
+            return resolved
+    return None
+
+
+def _resolve_resume_node_for_step(
+    *,
+    run_id: str,
+    from_step: Dict[str, Any],
+    replay_this_step: bool,
+) -> Optional[str]:
+    ordered_steps = db.read_steps(run_id)
+    from_step_internal = db.parse_step_id(from_step.get("step_id"))
+
+    if replay_this_step:
+        return _extract_resume_node(from_step)
+
+    found_anchor = False
+    for candidate in ordered_steps:
+        candidate_internal = db.parse_step_id(candidate.get("step_id") or candidate.get("id"))
+        if from_step_internal is not None and candidate_internal == from_step_internal:
+            found_anchor = True
+            continue
+        if not found_anchor:
+            continue
+        maybe_node = _extract_resume_node(candidate)
+        if maybe_node:
+            return maybe_node
+    return None
+
+
+def _build_run_input_from_source_run(source_run: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _json_loads(source_run.get("payload_json"))
+    payload_obj = payload if isinstance(payload, dict) else {}
+    source_input = payload_obj.get("input")
+    if isinstance(source_input, dict):
+        return copy.deepcopy(source_input)
+
+    run_input: Dict[str, Any] = {}
+    raw_task = str(payload_obj.get("task") or "").strip()
+    raw_message = str(payload_obj.get("message") or "").strip()
+    if raw_task:
+        run_input["task"] = raw_task
+    elif raw_message:
+        run_input["task"] = raw_message
+
+    raw_messages = payload_obj.get("messages")
+    if isinstance(raw_messages, list):
+        run_input["messages"] = copy.deepcopy(raw_messages)
+
+    raw_context = payload_obj.get("context")
+    if isinstance(raw_context, dict):
+        run_input["context"] = copy.deepcopy(raw_context)
+
+    raw_model_id = str(payload_obj.get("model_id") or "").strip()
+    if raw_model_id:
+        run_input["model"] = raw_model_id
+
+    raw_tool_ids = payload_obj.get("tool_ids")
+    if isinstance(raw_tool_ids, list):
+        run_input["tool_ids"] = [str(item) for item in raw_tool_ids if str(item).strip()]
+
+    raw_options = payload_obj.get("options")
+    if isinstance(raw_options, dict):
+        run_input["options"] = copy.deepcopy(raw_options)
+
+    return run_input
+
+
 @app.post("/runs/{run_id}/replay/dry_run", response_model=RunReplayResponse)
 async def run_replay_dry_run(run_id: str, request: RunReplayRequest) -> RunReplayResponse:
     prepared = _prepare_replay_context(run_id=run_id, request=request)
@@ -2593,6 +2804,241 @@ async def run_replay(run_id: str, request: RunReplayRequest) -> RunReplayRespons
         diagnostics=diagnostics,
         fork_start_state=fork_start_state,
         resume_node_id=resume_node_id or None,
+    )
+
+
+@app.post("/runs/{run_id}/rerun_from_state", response_model=RunRerunFromStateResponse)
+async def run_rerun_from_state(
+    run_id: str,
+    request: RunRerunFromStateRequest,
+) -> RunRerunFromStateResponse:
+    run_row = db.read_run(run_id)
+    if not run_row:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    selected_step_id = _resolve_step_id_by_index(run_id, request.step_index)
+    if not selected_step_id:
+        return RunRerunFromStateResponse(
+            new_run_id=None,
+            diagnostics=[
+                ReplayDiagnostic(
+                    code="STEP_INDEX_OUT_OF_RANGE",
+                    severity="error",
+                    message=f"Step index {request.step_index} was not found in this run.",
+                    path="step_index",
+                )
+            ],
+        )
+
+    selected_step = db.get_step(run_id, selected_step_id)
+    if selected_step is None:
+        return RunRerunFromStateResponse(
+            new_run_id=None,
+            diagnostics=[
+                ReplayDiagnostic(
+                    code="STEP_NOT_FOUND",
+                    severity="error",
+                    message=f"Step '{selected_step_id}' was not found in this run.",
+                    path="step_index",
+                )
+            ],
+        )
+
+    if not _is_success_step_status(selected_step.get("status")):
+        return RunRerunFromStateResponse(
+            new_run_id=None,
+            diagnostics=[
+                ReplayDiagnostic(
+                    code="STEP_NOT_REPLAYABLE",
+                    severity="error",
+                    message="Replay source step must be completed successfully.",
+                    path="step_index",
+                )
+            ],
+        )
+
+    edited_state = copy.deepcopy(dict(request.state_json or {}))
+    selected_post_state = _json_loads(selected_step.get("post_state_json"))
+    selected_post_state_obj = (
+        selected_post_state if isinstance(selected_post_state, dict) else {}
+    )
+    prompt_changed = _did_prompt_fields_change(
+        original_state=selected_post_state_obj,
+        edited_state=edited_state,
+    )
+
+    effective_from_step_id = selected_step_id
+    replay_this_step = request.resume == "same"
+    diagnostics: List[ReplayDiagnostic] = []
+    if prompt_changed:
+        rewind_step_id = _resolve_prompt_rewind_anchor_step_id(run_id)
+        if rewind_step_id:
+            effective_from_step_id = rewind_step_id
+            replay_this_step = False
+            diagnostics.append(
+                ReplayDiagnostic(
+                    code="PROMPT_CHANGE_REWIND_APPLIED",
+                    severity="info",
+                    message=(
+                        "Prompt fields changed. Replay start was rewound to regenerate LLM output."
+                    ),
+                    path="step_index",
+                )
+            )
+
+    source_workflow_version_id = str(run_row.get("workflow_version_id") or "").strip()
+    if not source_workflow_version_id:
+        from_step = db.get_step(run_id, effective_from_step_id)
+        if from_step is None:
+            return RunRerunFromStateResponse(
+                new_run_id=None,
+                diagnostics=[
+                    ReplayDiagnostic(
+                        code="STEP_NOT_FOUND",
+                        severity="error",
+                        message=f"Step '{effective_from_step_id}' was not found in this run.",
+                        path="step_index",
+                    )
+                ],
+            )
+
+        if not _is_success_step_status(from_step.get("status")):
+            return RunRerunFromStateResponse(
+                new_run_id=None,
+                diagnostics=[
+                    ReplayDiagnostic(
+                        code="STEP_NOT_REPLAYABLE",
+                        severity="error",
+                        message="Replay source step must be completed successfully.",
+                        path="step_index",
+                    )
+                ],
+            )
+
+        resume_node_id = _resolve_resume_node_for_step(
+            run_id=run_id,
+            from_step=from_step,
+            replay_this_step=replay_this_step,
+        )
+        if not resume_node_id and not replay_this_step:
+            # If "next" points past the terminal node, fallback to replaying the selected step.
+            replay_this_step = True
+            resume_node_id = _resolve_resume_node_for_step(
+                run_id=run_id,
+                from_step=from_step,
+                replay_this_step=True,
+            )
+        if not resume_node_id:
+            return RunRerunFromStateResponse(
+                new_run_id=None,
+                diagnostics=[
+                    ReplayDiagnostic(
+                        code="RESUME_NODE_NOT_FOUND",
+                        severity="error",
+                        message="Unable to determine a resume node from the selected step.",
+                        path="step_index",
+                    )
+                ],
+            )
+
+        payload = _json_loads(run_row.get("payload_json"))
+        result = _json_loads(run_row.get("result_json"))
+        metadata = _extract_run_metadata(payload=payload, result=result)
+        workflow_id = str(metadata.get("workflow_id") or "").strip()
+        if not workflow_id:
+            return RunRerunFromStateResponse(
+                new_run_id=None,
+                diagnostics=[
+                    ReplayDiagnostic(
+                        code="WORKFLOW_ID_MISSING",
+                        severity="error",
+                        message="Run does not have a workflow_id and cannot be replayed.",
+                        path="run.workflow_id",
+                    )
+                ],
+            )
+
+        replay_run_id = str(uuid.uuid4())
+        sandbox_mode = (
+            bool(request.sandbox)
+            if request.sandbox is not None
+            else bool(run_row.get("sandbox_mode"))
+        )
+        parent_step_id = db.format_step_id(from_step.get("step_id"))
+        fork_start_state = edited_state
+        fork_state_json = json.dumps(fork_start_state, default=str, ensure_ascii=True)
+        fork_patch_json = json.dumps(edited_state, default=str, ensure_ascii=True)
+        fork_reason = "manual_state_edit" if bool(edited_state) else "replay"
+        run_input = _build_run_input_from_source_run(run_row)
+
+        if sandbox_mode:
+            def _tool_gate(payload: Dict[str, Any]) -> bool:
+                return _SANDBOX_APPROVALS.request_decision(
+                    run_id=replay_run_id,
+                    payload=payload,
+                )
+
+            def _run_async() -> None:
+                graph.run_workflow(
+                    workflow_id=workflow_id,
+                    input=run_input,
+                    run_id=replay_run_id,
+                    sandbox_mode=True,
+                    tool_call_gate=_tool_gate,
+                    initial_state=fork_start_state,
+                    replay_mode=True,
+                    resume_node_id=resume_node_id,
+                    parent_run_id=run_id,
+                    parent_step_id=parent_step_id,
+                    forked_from_state_json=fork_state_json,
+                    fork_patch_json=fork_patch_json,
+                    fork_reason=fork_reason,
+                )
+
+            threading.Thread(target=_run_async, daemon=True).start()
+            return RunRerunFromStateResponse(
+                new_run_id=replay_run_id,
+                diagnostics=diagnostics,
+            )
+
+        graph.run_workflow(
+            workflow_id=workflow_id,
+            input=run_input,
+            run_id=replay_run_id,
+            sandbox_mode=False,
+            initial_state=fork_start_state,
+            replay_mode=True,
+            resume_node_id=resume_node_id,
+            parent_run_id=run_id,
+            parent_step_id=parent_step_id,
+            forked_from_state_json=fork_state_json,
+            fork_patch_json=fork_patch_json,
+            fork_reason=fork_reason,
+        )
+        return RunRerunFromStateResponse(
+            new_run_id=replay_run_id,
+            diagnostics=diagnostics,
+        )
+
+    replay_request = RunReplayRequest(
+        from_step_id=effective_from_step_id,
+        state_patch=edited_state,
+        patch_mode="replace",
+        sandbox=request.sandbox,
+        base_state="post",
+        replay_this_step=replay_this_step,
+    )
+    replay_response = await run_replay(run_id, replay_request)
+    if (
+        not replay_this_step
+        and replay_response.new_run_id is None
+        and any(item.code == "RESUME_NODE_NOT_FOUND" for item in replay_response.diagnostics)
+    ):
+        replay_request.replay_this_step = True
+        replay_response = await run_replay(run_id, replay_request)
+    return RunRerunFromStateResponse(
+        new_run_id=replay_response.new_run_id,
+        diagnostics=[*diagnostics, *(list(replay_response.diagnostics or []))],
     )
 
 

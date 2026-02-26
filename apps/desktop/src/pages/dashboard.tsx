@@ -18,24 +18,65 @@ type Page =
   | "local_docs"
   | "inspect";
 
+type DashboardNavigateDetail = {
+  page?: Page;
+  runId?: string;
+  sourceRunId?: string;
+  origin?: "rerun_from_state" | string;
+};
+
+type PendingChatRerun = {
+  runId: string;
+  sourceRunId?: string;
+  origin?: "rerun_from_state" | string;
+  nonce: string;
+};
+
+function createNonce(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export default function Dashboard() {
   const [page, setPage] = useState<Page>("chat");
   const [selectedInspectRunId, setSelectedInspectRunId] = useState<string | null>(
     null
   );
+  const [pendingChatRerun, setPendingChatRerun] = useState<PendingChatRerun | null>(
+    null
+  );
 
   useEffect(() => {
     const handler = (event: Event) => {
-      const customEvent = event as CustomEvent<{ page?: Page; runId?: string }>;
-      const targetPage = customEvent.detail?.page;
+      const customEvent = event as CustomEvent<DashboardNavigateDetail>;
+      const detail = customEvent.detail ?? {};
+      const targetPage = detail.page;
       if (!targetPage) {
         return;
       }
       if (targetPage === "inspect") {
-        const nextRunId = String(customEvent.detail?.runId || "").trim();
+        const nextRunId = String(detail.runId || "").trim();
         if (nextRunId) {
           setSelectedInspectRunId(nextRunId);
         }
+        setPendingChatRerun(null);
+      } else if (targetPage === "chat") {
+        const nextRunId = String(detail.runId || "").trim();
+        if (nextRunId) {
+          const sourceRunId = String(detail.sourceRunId || "").trim();
+          setPendingChatRerun({
+            runId: nextRunId,
+            sourceRunId: sourceRunId || undefined,
+            origin: detail.origin,
+            nonce: createNonce(),
+          });
+        } else {
+          setPendingChatRerun(null);
+        }
+      } else {
+        setPendingChatRerun(null);
       }
       setPage(targetPage);
     };
@@ -54,6 +95,12 @@ export default function Dashboard() {
           onInspectRun={(runId) => {
             setSelectedInspectRunId(runId);
             setPage("inspect");
+          }}
+          incomingRerun={pendingChatRerun}
+          onIncomingRerunHandled={(nonce) => {
+            setPendingChatRerun((current) =>
+              current && current.nonce === nonce ? null : current
+            );
           }}
         />
       ) : page === "models" ? (
