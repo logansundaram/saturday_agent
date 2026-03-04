@@ -17,6 +17,7 @@ try:
     from saturday_agent.llms.vision_registry import VisionModelRegistry
     from saturday_agent.runtime.registry import WorkflowRegistry
     from saturday_agent.runtime.tracing import StepEvent
+    from saturday_agent.usage_trace import emit_usage_trace as emit_agent_usage_trace
 except ModuleNotFoundError:
     repo_root = Path(__file__).resolve().parents[3]
     agent_src = repo_root / "apps/agent/src"
@@ -25,6 +26,7 @@ except ModuleNotFoundError:
     from saturday_agent.llms.vision_registry import VisionModelRegistry
     from saturday_agent.runtime.registry import WorkflowRegistry
     from saturday_agent.runtime.tracing import StepEvent
+    from saturday_agent.usage_trace import emit_usage_trace as emit_agent_usage_trace
 
 
 _REGISTRY = WorkflowRegistry()
@@ -170,12 +172,41 @@ def _clip_summary(value: str, *, limit: int = 140) -> str:
 
 
 def _first_line(value: Any) -> str:
-    text = ""
+    if value is None:
+        return ""
     if isinstance(value, dict):
-        text = str(value.get("message") or value.get("error") or "")
-    else:
-        text = str(value or "")
-    return text.splitlines()[0].strip()
+        for key in ("message", "detail", "error"):
+            nested = _first_line(value.get(key))
+            if nested:
+                return nested
+        return ""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            nested = _first_line(item)
+            if nested:
+                return nested
+        return ""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    return lines[0].strip() if lines else text
+
+
+def _extract_step_error(output_data: Dict[str, Any]) -> Any:
+    if not isinstance(output_data, dict):
+        return output_data
+    raw_error = output_data.get("error")
+    if raw_error is not None:
+        return raw_error
+    response = output_data.get("response")
+    if isinstance(response, dict):
+        nested_error = response.get("error")
+        if nested_error is not None:
+            return nested_error
+        if response.get("ok") is False:
+            return response
+    return output_data
 
 
 def _step_label(name: str) -> str:
@@ -547,7 +578,7 @@ class StepRecorder:
         stored_status = self._normalize_storage_status(status)
         error_json: Optional[str] = None
         if stored_status == "error":
-            raw_error = output_payload.get("error") if isinstance(output_payload, dict) else None
+            raw_error = _extract_step_error(output_payload if isinstance(output_payload, dict) else {})
             error_json = _json_dumps(
                 {
                     "message": _first_line(raw_error) or "Step failed.",
@@ -757,6 +788,7 @@ def invoke_tool(
 
     runtime_registry = _runtime_registry(tool_defs=merged_tool_defs)
     resolved_context = _inject_runtime_qdrant_context(dict(context or {}))
+    resolved_context.setdefault("__tool_callsite", "api:/tools/invoke")
     payload = {
         "tool_id": str(tool_id or ""),
         "input": dict(tool_input or {}),
@@ -790,6 +822,14 @@ def invoke_tool(
         )
     )
     try:
+        emit_agent_usage_trace(
+            "backend.tool_invoke_route",
+            {
+                "tool_name": str(tool_id or ""),
+                "callsite": str(resolved_context.get("__tool_callsite") or "api:/tools/invoke"),
+                "run_id": run_id,
+            },
+        )
         raw_output = runtime_registry.invoke_tool(
             tool_id=str(tool_id or ""),
             tool_input=dict(tool_input or {}),
@@ -976,6 +1016,7 @@ def run_workflow(
         "workflow_run",
         _json_dumps(run_payload),
         _to_iso(started_at),
+        workflow_id=workflow_id,
         workflow_version_id=workflow_version_id,
         sandbox_mode=sandbox_mode,
         parent_run_id=parent_run_id,
@@ -1103,6 +1144,7 @@ def run_chat_workflow_stream(
         "chat_stream",
         _json_dumps(base_payload),
         started_at,
+        workflow_id=workflow_id,
     )
 
     requested_tool_ids = [str(item).strip() for item in tool_ids if str(item).strip()]

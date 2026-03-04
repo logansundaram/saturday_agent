@@ -12,6 +12,11 @@ import httpx
 
 from saturday_agent.llms.ollama_chat import extract_assistant_text, ollama_chat
 from saturday_agent.state.models import ToolDefinition
+from saturday_agent.usage_trace import emit_usage_trace
+from saturday_agent.tools.langgraph_adapter import (
+    LangGraphToolAdapter,
+    build_langgraph_tool_adapter,
+)
 from saturday_agent.tools.search_tavily import (
     SEARCH_INPUT_SCHEMA,
     SEARCH_OUTPUT_SCHEMA,
@@ -53,7 +58,7 @@ from saturday_agent.tools.vision_ollama import (
     analyze_image_ollama,
 )
 
-ToolHandler = Callable[[Dict[str, Any], Optional[Dict[str, Any]]], Dict[str, Any]]
+ToolHandler = Callable[[Dict[str, Any], Optional[Dict[str, Any]]], Any]
 
 DEFAULT_HTTP_TIMEOUT_MS = 8000
 DEFAULT_PYTHON_TIMEOUT_MS = 5000
@@ -80,6 +85,7 @@ class ToolRegistry:
     def __init__(self, *, dynamic_tools: Optional[List[Dict[str, Any]]] = None) -> None:
         self._tools: Dict[str, Dict[str, Any]] = {}
         self._handlers: Dict[str, ToolHandler] = {}
+        self._adapters: Dict[str, LangGraphToolAdapter] = {}
 
         self.register_tool(
             tool_id="filesystem.read",
@@ -87,7 +93,11 @@ class ToolRegistry:
             description="Read, write, and manage files on the local machine.",
             kind="local",
             type="builtin",
-            enabled=True,
+            enabled=False,
+            deprecated_reason="Placeholder tool is not executable yet.",
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://filesystem.read",
             metadata={"source": "builtin"},
         )
         self.register_tool(
@@ -96,7 +106,11 @@ class ToolRegistry:
             description="Inspect workflow nodes, edges, and run traces.",
             kind="local",
             type="builtin",
-            enabled=True,
+            enabled=False,
+            deprecated_reason="Placeholder tool is not executable yet.",
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://workflow.inspect",
             metadata={"source": "builtin"},
         )
         self.register_tool(
@@ -109,6 +123,9 @@ class ToolRegistry:
             input_schema=SEARCH_INPUT_SCHEMA,
             output_schema=SEARCH_OUTPUT_SCHEMA,
             handler=self._wrap_legacy_handler(search_web_tavily),
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://search.web",
             metadata={"source": "builtin"},
         )
         self.register_tool(
@@ -121,6 +138,9 @@ class ToolRegistry:
             input_schema=RAG_RETRIEVE_INPUT_SCHEMA,
             output_schema=RAG_RETRIEVE_OUTPUT_SCHEMA,
             handler=retrieve_qdrant_chunks,
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://rag.retrieve",
             metadata={"source": "builtin"},
         )
         self.register_tool(
@@ -133,6 +153,9 @@ class ToolRegistry:
             input_schema=INGEST_PDF_INPUT_SCHEMA,
             output_schema=INGEST_PDF_OUTPUT_SCHEMA,
             handler=ingest_pdf_document,
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://rag.ingest_pdf",
             metadata={"source": "builtin"},
         )
         self.register_tool(
@@ -145,6 +168,9 @@ class ToolRegistry:
             input_schema=RAG_LIST_DOCS_INPUT_SCHEMA,
             output_schema=RAG_LIST_DOCS_OUTPUT_SCHEMA,
             handler=list_rag_docs,
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://rag.list_docs",
             metadata={"source": "builtin"},
         )
         self.register_tool(
@@ -157,6 +183,9 @@ class ToolRegistry:
             input_schema=RAG_DELETE_DOC_INPUT_SCHEMA,
             output_schema=RAG_DELETE_DOC_OUTPUT_SCHEMA,
             handler=delete_rag_doc,
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://rag.delete_doc",
             metadata={"source": "builtin"},
         )
         self.register_tool(
@@ -169,6 +198,9 @@ class ToolRegistry:
             input_schema=VISION_ANALYZE_INPUT_SCHEMA,
             output_schema=VISION_ANALYZE_OUTPUT_SCHEMA,
             handler=self._wrap_legacy_handler(analyze_image_ollama),
+            version=1,
+            implementation_kind="builtin",
+            implementation_ref="builtin://vision.analyze",
             metadata={"source": "builtin"},
         )
         self.register_dynamic_tools(dynamic_tools or [])
@@ -187,25 +219,49 @@ class ToolRegistry:
         output_schema: Dict[str, Any] | None = None,
         created_at: str | None = None,
         updated_at: str | None = None,
+        version: int = 1,
+        deleted_at: str | None = None,
+        deprecated_reason: str | None = None,
+        implementation_kind: str | None = None,
+        implementation_ref: str | None = None,
         handler: ToolHandler | None = None,
         metadata: Dict[str, Any] | None = None,
     ) -> None:
-        self._tools[tool_id] = {
+        metadata_map = dict(metadata or {})
+        tool_record = {
             "id": tool_id,
+            "tool_id": tool_id,
             "name": name,
             "kind": kind,
             "type": type,
             "description": description,
-            "enabled": enabled,
+            "enabled": bool(enabled),
             "config": dict(config or {}),
             "input_schema": dict(input_schema or {}),
             "output_schema": dict(output_schema or {}),
             "created_at": str(created_at or ""),
             "updated_at": str(updated_at or ""),
-            "metadata": dict(metadata or {}),
+            "version": max(int(version or 1), 1),
+            "deleted_at": str(deleted_at or "") or None,
+            "deprecated_reason": str(deprecated_reason or "") or None,
+            "implementation_kind": str(
+                implementation_kind or self._implementation_kind_for_type(type)
+            ),
+            "implementation_ref": str(
+                implementation_ref or self._implementation_ref_for_tool(tool_id, type, dict(config or {}))
+            ),
+            "source": str(metadata_map.get("source") or "custom"),
+            "metadata": metadata_map,
         }
+        self._tools[tool_id] = tool_record
         if handler is not None:
             self._handlers[tool_id] = handler
+            self._adapters[tool_id] = build_langgraph_tool_adapter(
+                tool_spec=tool_record,
+                handler=handler,
+            )
+        elif tool_id in self._adapters:
+            self._adapters.pop(tool_id, None)
 
     def register_dynamic_tools(
         self,
@@ -215,18 +271,27 @@ class ToolRegistry:
             if not isinstance(raw_tool, dict):
                 continue
 
-            tool_id = str(raw_tool.get("id") or "").strip()
+            tool_id = str(raw_tool.get("id") or raw_tool.get("tool_id") or "").strip()
             if not tool_id:
                 continue
 
-            tool_name = str(raw_tool.get("name") or tool_id).strip() or tool_id
-            tool_type = str(raw_tool.get("type") or "http").strip().lower()
-            if tool_type not in {"http", "python", "prompt"}:
-                continue
+            existing_tool = self.get_tool(tool_id) or {}
+            tool_name = str(
+                raw_tool.get("name") or existing_tool.get("name") or tool_id
+            ).strip() or tool_id
+            tool_type = str(
+                raw_tool.get("type") or existing_tool.get("type") or "http"
+            ).strip().lower()
+            config = dict(raw_tool.get("config") or existing_tool.get("config") or {})
 
-            config = dict(raw_tool.get("config") or {})
-            handler: ToolHandler
-            if tool_type == "http":
+            handler: ToolHandler | None = None
+            if tool_type not in {"http", "python", "prompt"}:
+                if not existing_tool:
+                    continue
+                handler = self._handlers.get(tool_id)
+                tool_type = str(existing_tool.get("type") or "builtin")
+                config = dict(existing_tool.get("config") or {})
+            elif tool_type == "http":
                 handler = self._build_http_handler(tool_id=tool_id, config=config)
             elif tool_type == "python":
                 handler = self._build_python_handler(tool_id=tool_id, config=config)
@@ -236,25 +301,67 @@ class ToolRegistry:
             self.register_tool(
                 tool_id=tool_id,
                 name=tool_name,
-                description=str(raw_tool.get("description") or ""),
-                kind=str(raw_tool.get("kind") or "external"),
+                description=str(
+                    raw_tool.get("description") or existing_tool.get("description") or ""
+                ),
+                kind=str(raw_tool.get("kind") or existing_tool.get("kind") or "external"),
                 type=tool_type,
-                enabled=bool(raw_tool.get("enabled", True)),
+                enabled=bool(
+                    raw_tool.get("enabled", existing_tool.get("enabled", True))
+                ),
                 config=config,
                 input_schema=(
                     dict(raw_tool.get("input_schema"))
                     if isinstance(raw_tool.get("input_schema"), dict)
+                    else dict(existing_tool.get("input_schema") or {})
+                    if isinstance(existing_tool.get("input_schema"), dict)
                     else None
                 ),
                 output_schema=(
                     dict(raw_tool.get("output_schema"))
                     if isinstance(raw_tool.get("output_schema"), dict)
+                    else dict(existing_tool.get("output_schema") or {})
+                    if isinstance(existing_tool.get("output_schema"), dict)
                     else None
                 ),
-                created_at=str(raw_tool.get("created_at") or ""),
-                updated_at=str(raw_tool.get("updated_at") or ""),
+                created_at=str(
+                    raw_tool.get("created_at") or existing_tool.get("created_at") or ""
+                ),
+                updated_at=str(
+                    raw_tool.get("updated_at") or existing_tool.get("updated_at") or ""
+                ),
+                version=int(raw_tool.get("version") or existing_tool.get("version") or 1),
+                deleted_at=(
+                    str(raw_tool.get("deleted_at") or existing_tool.get("deleted_at") or "")
+                    or None
+                ),
+                deprecated_reason=(
+                    str(
+                        raw_tool.get("deprecated_reason")
+                        or existing_tool.get("deprecated_reason")
+                        or ""
+                    )
+                    or None
+                ),
+                implementation_kind=str(
+                    raw_tool.get("implementation_kind")
+                    or existing_tool.get("implementation_kind")
+                    or ""
+                ),
+                implementation_ref=str(
+                    raw_tool.get("implementation_ref")
+                    or existing_tool.get("implementation_ref")
+                    or ""
+                ),
                 handler=handler,
-                metadata={"source": str(raw_tool.get("source") or "custom")},
+                metadata={
+                    "source": str(
+                        raw_tool.get("source")
+                        or existing_tool.get("source")
+                        or (existing_tool.get("metadata") or {}).get("source")
+                        or "custom"
+                    )
+                },
             )
 
     def list_tools(self) -> List[Dict[str, Any]]:
@@ -262,6 +369,7 @@ class ToolRegistry:
         return [
             {
                 "id": str(tool.get("id", "")),
+                "tool_id": str(tool.get("tool_id", tool.get("id", ""))),
                 "name": str(tool.get("name", "")),
                 "kind": str(tool.get("kind", "local")),
                 "type": str(tool.get("type", "builtin")),
@@ -270,9 +378,14 @@ class ToolRegistry:
                 "config": dict(tool.get("config") or {}),
                 "input_schema": dict(tool.get("input_schema") or {}),
                 "output_schema": dict(tool.get("output_schema") or {}),
+                "implementation_kind": str(tool.get("implementation_kind") or ""),
+                "implementation_ref": str(tool.get("implementation_ref") or ""),
+                "version": int(tool.get("version") or 1),
+                "deleted_at": tool.get("deleted_at"),
+                "deprecated_reason": tool.get("deprecated_reason"),
                 "created_at": str(tool.get("created_at") or ""),
                 "updated_at": str(tool.get("updated_at") or ""),
-                "source": str((tool.get("metadata") or {}).get("source") or "builtin"),
+                "source": str(tool.get("source") or (tool.get("metadata") or {}).get("source") or "builtin"),
             }
             for tool in ordered
         ]
@@ -288,6 +401,12 @@ class ToolRegistry:
         record["metadata"] = dict(tool.get("metadata") or {})
         return record
 
+    def get_langgraph_tool(self, tool_id: str) -> Any | None:
+        adapter = self._adapters.get(tool_id)
+        if adapter is None:
+            return None
+        return adapter.langgraph_tool
+
     def invoke(
         self,
         tool_id: str,
@@ -302,38 +421,46 @@ class ToolRegistry:
         if not isinstance(tool_input, dict):
             raise ValueError("Tool input must be an object.")
 
-        handler = self._handlers.get(tool_id)
-        if handler is None:
+        adapter = self._adapters.get(tool_id)
+        if adapter is None:
             raise ValueError(f"Tool '{tool_id}' is not executable yet.")
 
-        try:
-            response = handler(dict(tool_input), dict(context or {}))
-        except Exception as exc:
-            return self._error_envelope(
-                tool=tool,
-                kind="runtime",
-                message=str(exc),
-                meta={"tool_id": tool_id},
-            )
-
-        if self._is_standard_envelope(response):
-            return response
-
-        if isinstance(response, dict) and isinstance(response.get("error"), dict):
-            err = response.get("error") or {}
-            return self._error_envelope(
-                tool=tool,
-                kind=str(err.get("type") or "runtime"),
-                message=str(err.get("message") or "Tool execution failed."),
-                meta={"tool_id": tool_id, "raw": response},
-            )
-
-        return self._success_envelope(tool=tool, data=response, meta={"tool_id": tool_id})
+        logger = None
+        if isinstance(context, dict) and callable(context.get("__tool_logger")):
+            logger = context.get("__tool_logger")
+        callsite = (
+            str((context or {}).get("__tool_callsite") or "").strip()
+            if isinstance(context, dict)
+            else ""
+        )
+        emit_usage_trace(
+            "backend.tool_invocation",
+            {
+                "tool_name": tool_id,
+                "callsite": callsite or "unknown",
+                "tool_type": str(tool.get("type") or ""),
+                "implementation_kind": str(tool.get("implementation_kind") or ""),
+            },
+        )
+        return adapter.invoke(
+            dict(tool_input),
+            context=dict(context or {}),
+            logger=logger,
+        )
 
     def invoke_tool(
         self,
         tool_id: str,
         tool_input: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.invoke(tool_id=tool_id, tool_input=tool_input, context=context)
+
+    def invoke_langgraph_tool(
+        self,
+        tool_id: str,
+        tool_input: Dict[str, Any],
+        *,
         context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return self.invoke(tool_id=tool_id, tool_input=tool_input, context=context)
@@ -747,6 +874,33 @@ class ToolRegistry:
             },
             "meta": dict(meta or {}),
         }
+
+    @staticmethod
+    def _implementation_kind_for_type(tool_type: str) -> str:
+        normalized = str(tool_type or "").strip().lower()
+        if normalized == "builtin":
+            return "builtin"
+        if normalized == "http":
+            return "http"
+        if normalized == "prompt":
+            return "prompt"
+        return "python_module"
+
+    @classmethod
+    def _implementation_ref_for_tool(
+        cls,
+        tool_id: str,
+        tool_type: str,
+        config: Dict[str, Any],
+    ) -> str:
+        normalized = str(tool_type or "").strip().lower()
+        if normalized == "builtin":
+            return f"builtin://{tool_id}"
+        if normalized == "http":
+            return str(config.get("url") or f"http://tool/{tool_id}")
+        if normalized == "prompt":
+            return f"prompt://{tool_id}"
+        return f"inline://{tool_id}"
 
     @staticmethod
     def _normalize_http_config(config: Dict[str, Any]) -> Dict[str, Any]:

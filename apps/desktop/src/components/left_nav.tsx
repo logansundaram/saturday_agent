@@ -5,6 +5,7 @@ type Page =
     | "builder"
     | "workflows"
     | "local_docs"
+    | "projects"
     | "inspect";
 
 interface LeftNavProps{
@@ -37,6 +38,9 @@ export default function LeftNav({page, onNavigate} : LeftNavProps){
                 </p>
                 <p className={itemClass("local_docs")} onClick={() => onNavigate("local_docs")}>
                     Local Docs
+                </p>
+                <p className={itemClass("projects")} onClick={() => onNavigate("projects")}>
+                    Projects
                 </p>
                 <p className={itemClass("inspect")} onClick={() => onNavigate("inspect")}>
                     Inspect

@@ -71,7 +71,10 @@ async function collectMetrics(): Promise<SystemMetrics> {
       safe(() => si.cpu(), { brand: "CPU", cores: 0, physicalCores: 0 } as Awaited<ReturnType<typeof si.cpu>>),
       safe(() => si.currentLoad(), { currentLoad: 0 } as Awaited<ReturnType<typeof si.currentLoad>>),
       safe(() => si.mem(), { total: 0, used: 0, active: 0 } as Awaited<ReturnType<typeof si.mem>>),
-      safe(() => si.graphics(), { controllers: [] } as Awaited<ReturnType<typeof si.graphics>>),
+      safe(
+        () => si.graphics(),
+        { controllers: [], displays: [] } as unknown as Awaited<ReturnType<typeof si.graphics>>
+      ),
       safe(() => si.osInfo(), { platform: process.platform, arch: process.arch } as Awaited<ReturnType<typeof si.osInfo>>),
       safe(() => si.time(), { uptime: 0 } as Awaited<ReturnType<typeof si.time>>),
       safe(() => fetchBackendHealth(), { api: "down", ollama: "down" } as SystemMetrics["backend"]),
@@ -114,7 +117,7 @@ function normalizeGpu(graphicsInfo: Awaited<ReturnType<typeof si.graphics>>):
     return null;
   }
 
-  const record = controller as Record<string, unknown>;
+  const record = controller as unknown as Record<string, unknown>;
   const vramTotalRaw = getNumber(record.vram) ?? getNumber(record.memoryTotal);
   const vramUsedRaw = getNumber(record.vramUsed) ?? getNumber(record.memoryUsed);
   const utilization = getNumber(record.utilizationGpu);
@@ -222,7 +225,7 @@ function normalizeBytes(value?: number): number | undefined {
   return Math.round(value);
 }
 
-async function safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
+async function safe<T>(fn: () => T | Promise<T>, fallback: T): Promise<T> {
   try {
     return await fn();
   } catch {

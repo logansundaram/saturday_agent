@@ -359,6 +359,26 @@ def validate_and_compile_workflow_spec(
             str(item.get("id") or ""),
         ),
     )
+    normalized["entry_node"] = entry_nodes[0] if entry_nodes else None
+    normalized["terminal_nodes"] = sorted(
+        [
+            str(item.get("id") or "")
+            for item in normalized["nodes"]
+            if str(item.get("type") or "") == "finalize"
+        ]
+    )
+    normalized["tool_refs"] = sorted(
+        {
+            str(
+                (item.get("config") or {}).get("tool_name")
+                or (item.get("config") or {}).get("tool_id")
+                or ""
+            ).strip()
+            for item in normalized["nodes"]
+            if str(item.get("type") or "") == "tool"
+        }
+        - {""}
+    )
 
     compiled = _compile_from_normalized(normalized, entry_nodes=entry_nodes)
     return ValidationResult(workflow_spec=normalized, compiled=compiled, diagnostics=diagnostics)
@@ -367,12 +387,20 @@ def validate_and_compile_workflow_spec(
 def _normalize_workflow_spec(workflow_spec: Mapping[str, Any]) -> Dict[str, Any]:
     output: Dict[str, Any] = {
         "workflow_id": str(workflow_spec.get("workflow_id") or "").strip() or None,
+        "version": (
+            int(workflow_spec.get("version"))
+            if isinstance(workflow_spec.get("version"), int)
+            else None
+        ),
         "name": str(workflow_spec.get("name") or "").strip(),
         "description": str(workflow_spec.get("description") or "").strip(),
         "allow_cycles": bool(workflow_spec.get("allow_cycles", False)),
         "state_schema": [],
         "nodes": [],
         "edges": [],
+        "entry_node": None,
+        "terminal_nodes": [],
+        "tool_refs": [],
         "metadata": dict(workflow_spec.get("metadata") or {}),
     }
 

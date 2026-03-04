@@ -52,8 +52,12 @@ def _resolve_httpx_timeout(timeout_seconds: float) -> float | None:
 
 def _resolve_db_path() -> Path:
     repo_root = Path(__file__).resolve().parents[5]
-    env_value = os.getenv("SATURDAY_DB_PATH")
+    env_value = str(os.getenv("SATURDAY_DB_PATH") or "").strip()
     if env_value:
+        if env_value == ":memory:":
+            # Preserve the legacy "memory db" intent without creating an
+            # invalid filename on Windows.
+            env_value = "memory.sqlite"
         env_path = Path(env_value)
         if env_path.is_absolute():
             return env_path

@@ -6,9 +6,17 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _DB_PATH: Optional[str] = None
+
+
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):  # type: ignore[override]
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 def init_db(db_path: str) -> None:
@@ -34,6 +42,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         _migration_2_workflow_versioning,
         _migration_3_run_steps_and_tool_calls,
         _migration_4_run_replay_and_state_snapshots,
+        _migration_5_tool_versioning_and_step_logs,
+        _migration_6_projects,
     ]
 
     while current_version < len(migrations):
@@ -364,6 +374,194 @@ def _migration_4_run_replay_and_state_snapshots(conn: sqlite3.Connection) -> Non
     _backfill_run_step_states(conn)
 
 
+def _migration_5_tool_versioning_and_step_logs(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "tools"):
+        return
+    _ensure_column(conn, "tools", "deleted_at", "TEXT")
+    _ensure_column(conn, "tools", "current_version_num", "INTEGER NOT NULL DEFAULT 0")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tool_versions (
+            version_id TEXT PRIMARY KEY,
+            tool_id TEXT NOT NULL,
+            version_num INTEGER NOT NULL,
+            spec_json TEXT NOT NULL,
+            implementation_kind TEXT NOT NULL,
+            implementation_ref TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT 'system',
+            FOREIGN KEY (tool_id) REFERENCES tools(id),
+            UNIQUE (tool_id, version_num)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_tool_versions_tool_id_version_num
+        ON tool_versions (tool_id, version_num DESC)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS step_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            step_index INTEGER NOT NULL DEFAULT 0,
+            node_id TEXT NOT NULL,
+            node_type TEXT NOT NULL,
+            tool_name TEXT,
+            status TEXT NOT NULL DEFAULT 'success',
+            input_json TEXT,
+            output_json TEXT,
+            error_json TEXT,
+            summary TEXT,
+            ts_start TEXT NOT NULL,
+            ts_end TEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES runs(run_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_step_logs_run_id_step_index
+        ON step_logs (run_id, step_index)
+        """
+    )
+
+    tool_rows = conn.execute(
+        """
+        SELECT id, name, kind, type, description, enabled,
+               config_json, input_schema_json, output_schema_json,
+               created_at, updated_at, deleted_at, current_version_num
+        FROM tools
+        ORDER BY COALESCE(updated_at, created_at) ASC, id ASC
+        """
+    ).fetchall()
+    for row in tool_rows:
+        _ensure_tool_version_row(conn, row)
+
+
+def _migration_6_projects(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "runs", "workflow_id", "TEXT")
+    _ensure_column(conn, "runs", "project_id", "TEXT")
+    _ensure_column(conn, "runs", "chat_id", "TEXT")
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runs_project_id_started_at
+        ON runs (project_id, started_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_runs_project_chat_id_started_at
+        ON runs (project_id, chat_id, started_at DESC)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_chats (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_project_chats_project_id_created_at
+        ON project_chats (project_id, created_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_documents (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            filepath TEXT NOT NULL,
+            embedding_model TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ready',
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_project_documents_project_id_created_at
+        ON project_documents (project_id, created_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_ground_truth (
+            project_id TEXT PRIMARY KEY,
+            content TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_tools (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            version INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (project_id) REFERENCES projects(id),
+            UNIQUE (project_id, tool_name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_project_tools_project_id
+        ON project_tools (project_id, tool_name)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_workflows (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            workflow_spec TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (project_id) REFERENCES projects(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_project_workflows_project_id_created_at
+        ON project_workflows (project_id, created_at DESC)
+        """
+    )
+
+
 def _backfill_run_step_states(conn: sqlite3.Connection) -> None:
     run_rows = conn.execute(
         """
@@ -458,7 +656,10 @@ def create_run(
     payload_json: str,
     started_at: str,
     *,
+    workflow_id: Optional[str] = None,
     workflow_version_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    chat_id: Optional[str] = None,
     sandbox_mode: bool = False,
     status: str = "running",
     parent_run_id: Optional[str] = None,
@@ -474,11 +675,11 @@ def create_run(
             """
             INSERT INTO runs (
                 run_id, kind, status, payload_json, started_at,
-                workflow_version_id, sandbox_mode,
+                workflow_id, workflow_version_id, project_id, chat_id, sandbox_mode,
                 parent_run_id, parent_step_id,
                 forked_from_state_json, fork_patch_json, fork_reason,
                 resume_from_node_id, mode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -486,7 +687,10 @@ def create_run(
                 status,
                 payload_json,
                 started_at,
+                workflow_id,
                 workflow_version_id,
+                project_id,
+                chat_id,
                 1 if sandbox_mode else 0,
                 parent_run_id,
                 parent_step_id,
@@ -588,8 +792,32 @@ def add_step(
                 post_state_json,
             ),
         )
+        internal_step_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO step_logs (
+                run_id, step_id, step_index, node_id, node_type, tool_name,
+                status, input_json, output_json, error_json, summary, ts_start, ts_end
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                format_step_id(internal_step_id),
+                step_index,
+                node_id_final,
+                node_type_final,
+                node_id_final if node_type_final == "tool" else None,
+                status,
+                input_json,
+                output_json,
+                error_json,
+                summary,
+                started_at,
+                ended_at,
+            ),
+        )
         conn.commit()
-        return int(cursor.lastrowid)
+        return internal_step_id
 
 
 def get_run(run_id: str) -> Optional[dict]:
@@ -598,7 +826,8 @@ def get_run(run_id: str) -> Optional[dict]:
             """
             SELECT run_id, kind, status, payload_json, result_json,
                    started_at, ended_at, finished_at,
-                   workflow_version_id, sandbox_mode, error,
+                   workflow_id, workflow_version_id, project_id, chat_id,
+                   sandbox_mode, error,
                    parent_run_id, parent_step_id,
                    forked_from_state_json, fork_patch_json, fork_reason,
                    resume_from_node_id, mode
@@ -1038,19 +1267,55 @@ def read_artifact(artifact_id: str) -> Optional[dict]:
 # Tool registry persistence
 # ---------------------------------------------------------------------------
 
-def upsert_tool(tool: dict) -> None:
+def upsert_tool(tool: dict, *, created_by: str = "system") -> None:
     tool_id = str(tool.get("id") or "").strip()
     if not tool_id:
         raise ValueError("Tool id is required.")
 
     with _connect() as conn:
+        now = _now_utc_iso()
+        existing = conn.execute(
+            """
+            SELECT id, name, kind, type, description, enabled,
+                   config_json, input_schema_json, output_schema_json,
+                   created_at, updated_at, deleted_at, current_version_num
+            FROM tools
+            WHERE id = ?
+            """,
+            (tool_id,),
+        ).fetchone()
+        created_at = str(
+            tool.get("created_at")
+            or (existing["created_at"] if existing is not None else "")
+            or now
+        )
+        updated_at = str(tool.get("updated_at") or now)
+        latest_version = _get_latest_tool_version_row(conn, tool_id)
+        compare_version = int(latest_version["version_num"] or 1) if latest_version else 1
+        candidate_spec = _tool_spec_from_definition(
+            tool,
+            version=compare_version,
+            created_at=created_at,
+            updated_at=updated_at,
+            deleted_at=tool.get("deleted_at"),
+        )
+        existing_spec = (
+            _json_loads(latest_version["spec_json"])
+            if latest_version is not None
+            else None
+        )
+        version_changed = not isinstance(existing_spec, dict) or existing_spec != candidate_spec
+        next_version = 1 if latest_version is None else int(latest_version["version_num"] or 0)
+        if latest_version is not None and version_changed:
+            next_version += 1
+
         conn.execute(
             """
             INSERT INTO tools (
                 id, name, kind, type, description, enabled,
                 config_json, input_schema_json, output_schema_json,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, deleted_at, current_version_num
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 kind = excluded.kind,
@@ -1060,8 +1325,9 @@ def upsert_tool(tool: dict) -> None:
                 config_json = excluded.config_json,
                 input_schema_json = excluded.input_schema_json,
                 output_schema_json = excluded.output_schema_json,
-                created_at = excluded.created_at,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                deleted_at = excluded.deleted_at,
+                current_version_num = excluded.current_version_num
             """,
             (
                 tool_id,
@@ -1075,58 +1341,167 @@ def upsert_tool(tool: dict) -> None:
                 ),
                 _json_dumps(tool.get("input_schema")),
                 _json_dumps(tool.get("output_schema")),
-                str(tool.get("created_at") or ""),
-                str(tool.get("updated_at") or ""),
+                created_at,
+                updated_at,
+                str(tool.get("deleted_at") or "") or None,
+                max(next_version, 1),
             ),
         )
+        if latest_version is None or version_changed:
+            spec_payload = _tool_spec_from_definition(
+                tool,
+                version=max(next_version, 1),
+                created_at=created_at,
+                updated_at=updated_at,
+                deleted_at=tool.get("deleted_at"),
+            )
+            conn.execute(
+                """
+                INSERT INTO tool_versions (
+                    version_id, tool_id, version_num, spec_json,
+                    implementation_kind, implementation_ref,
+                    created_at, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"{tool_id}:v{max(next_version, 1)}",
+                    tool_id,
+                    max(next_version, 1),
+                    _json_dumps(spec_payload),
+                    str(spec_payload.get("implementation_kind") or "python_module"),
+                    str(spec_payload.get("implementation_ref") or ""),
+                    updated_at,
+                    str(created_by or "system"),
+                ),
+            )
         conn.commit()
 
 
-def list_tools() -> list[dict]:
+def list_tools(*, include_deleted: bool = False) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
             """
             SELECT id, name, kind, type, description, enabled,
                    config_json, input_schema_json, output_schema_json,
-                   created_at, updated_at
+                   created_at, updated_at, deleted_at, current_version_num
             FROM tools
+            WHERE (? = 1 OR deleted_at IS NULL OR TRIM(deleted_at) = '')
             ORDER BY name COLLATE NOCASE ASC, id ASC
-            """
+            """,
+            (1 if include_deleted else 0,),
         ).fetchall()
-        return [_tool_row_to_definition(row) for row in rows]
+        output: list[dict] = []
+        for row in rows:
+            _ensure_tool_version_row(conn, row)
+            output.append(_tool_row_to_definition(row, conn=conn))
+        return output
 
 
-def get_tool(tool_id: str) -> Optional[dict]:
+def get_tool(tool_id: str, *, include_deleted: bool = False) -> Optional[dict]:
     with _connect() as conn:
         row = conn.execute(
             """
             SELECT id, name, kind, type, description, enabled,
                    config_json, input_schema_json, output_schema_json,
-                   created_at, updated_at
+                   created_at, updated_at, deleted_at, current_version_num
+            FROM tools
+            WHERE id = ?
+              AND (? = 1 OR deleted_at IS NULL OR TRIM(deleted_at) = '')
+            """,
+            (tool_id, 1 if include_deleted else 0),
+        ).fetchone()
+        if row is None:
+            return None
+        _ensure_tool_version_row(conn, row)
+        return _tool_row_to_definition(row, conn=conn)
+
+
+def set_tool_enabled(tool_id: str, enabled: bool, *, created_by: str = "system") -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, name, kind, type, description, enabled,
+                   config_json, input_schema_json, output_schema_json,
+                   created_at, updated_at, deleted_at, current_version_num
             FROM tools
             WHERE id = ?
             """,
             (tool_id,),
         ).fetchone()
         if row is None:
-            return None
-        return _tool_row_to_definition(row)
+            return False
+        current_enabled = bool(int(row["enabled"] or 0))
+        if current_enabled == bool(enabled):
+            return True
+        payload = _tool_row_to_definition(row, conn=conn)
+        payload["enabled"] = bool(enabled)
+        payload["updated_at"] = _now_utc_iso()
+    upsert_tool(payload, created_by=created_by)
+    return True
 
 
-def set_tool_enabled(tool_id: str, enabled: bool) -> bool:
-    updated_at = _now_utc_iso()
+def soft_delete_tool(tool_id: str, *, created_by: str = "system") -> bool:
     with _connect() as conn:
-        result = conn.execute(
+        row = conn.execute(
             """
-            UPDATE tools
-            SET enabled = ?,
-                updated_at = ?
+            SELECT id, name, kind, type, description, enabled,
+                   config_json, input_schema_json, output_schema_json,
+                   created_at, updated_at, deleted_at, current_version_num
+            FROM tools
             WHERE id = ?
             """,
-            (1 if enabled else 0, updated_at, tool_id),
-        )
-        conn.commit()
-        return result.rowcount > 0
+            (tool_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        payload = _tool_row_to_definition(row, conn=conn)
+        if str(payload.get("deleted_at") or "").strip():
+            return True
+        payload["deleted_at"] = _now_utc_iso()
+        payload["updated_at"] = str(payload.get("deleted_at") or "")
+    upsert_tool(payload, created_by=created_by)
+    return True
+
+
+def get_latest_tool_version(tool_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = _get_latest_tool_version_row(conn, tool_id)
+        if row is None:
+            return None
+        return _tool_version_row_to_payload(row)
+
+
+def list_tool_versions(tool_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT version_id, tool_id, version_num, spec_json,
+                   implementation_kind, implementation_ref,
+                   created_at, created_by
+            FROM tool_versions
+            WHERE tool_id = ?
+            ORDER BY version_num DESC
+            """,
+            (tool_id,),
+        ).fetchall()
+        return [_tool_version_row_to_payload(row) for row in rows]
+
+
+def get_tool_version(version_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT version_id, tool_id, version_num, spec_json,
+                   implementation_kind, implementation_ref,
+                   created_at, created_by
+            FROM tool_versions
+            WHERE version_id = ?
+            """,
+            (version_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _tool_version_row_to_payload(row)
 
 
 # ---------------------------------------------------------------------------
@@ -1393,14 +1768,665 @@ def upsert_workflow(workflow: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Project persistence
+# ---------------------------------------------------------------------------
+
+def create_project(*, name: str, description: str = "") -> dict:
+    project_id = str(uuid.uuid4())
+    now = _now_utc_iso()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO projects (id, name, description, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (project_id, str(name or "").strip(), str(description or ""), now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO project_ground_truth (project_id, content, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(project_id) DO NOTHING
+            """,
+            (project_id, "", now),
+        )
+        conn.commit()
+    payload = get_project(project_id)
+    if payload is None:
+        raise RuntimeError("Project was not persisted.")
+    return payload
+
+
+def list_projects() -> List[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+                   (SELECT COUNT(1) FROM project_chats c WHERE c.project_id = p.id) AS chat_count,
+                   (SELECT COUNT(1) FROM project_documents d WHERE d.project_id = p.id) AS document_count,
+                   (
+                       SELECT r.run_id
+                       FROM runs r
+                       WHERE r.project_id = p.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_id,
+                   (
+                       SELECT r.started_at
+                       FROM runs r
+                       WHERE r.project_id = p.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_at
+            FROM projects p
+            ORDER BY p.updated_at DESC, p.created_at DESC, p.name COLLATE NOCASE ASC
+            """
+        ).fetchall()
+        return [_project_row_to_payload(row) for row in rows]
+
+
+def get_project(project_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT p.id, p.name, p.description, p.created_at, p.updated_at,
+                   (SELECT COUNT(1) FROM project_chats c WHERE c.project_id = p.id) AS chat_count,
+                   (SELECT COUNT(1) FROM project_documents d WHERE d.project_id = p.id) AS document_count,
+                   (
+                       SELECT r.run_id
+                       FROM runs r
+                       WHERE r.project_id = p.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_id,
+                   (
+                       SELECT r.started_at
+                       FROM runs r
+                       WHERE r.project_id = p.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_at
+            FROM projects p
+            WHERE p.id = ?
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _project_row_to_payload(row)
+
+
+def delete_project(project_id: str) -> bool:
+    with _connect() as conn:
+        conn.execute("DELETE FROM project_documents WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM project_tools WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM project_workflows WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM project_ground_truth WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM project_chats WHERE project_id = ?", (project_id,))
+        result = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        conn.commit()
+        return int(result.rowcount or 0) > 0
+
+
+def create_project_chat(*, project_id: str, name: str) -> dict:
+    chat_id = str(uuid.uuid4())
+    created_at = _now_utc_iso()
+    with _connect() as conn:
+        if not _project_exists(conn, project_id):
+            raise ValueError("Project not found.")
+        conn.execute(
+            """
+            INSERT INTO project_chats (id, project_id, name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, project_id, str(name or "").strip() or "New Chat", created_at),
+        )
+        _touch_project(conn, project_id, updated_at=created_at)
+        conn.commit()
+    payload = get_project_chat(project_id=project_id, chat_id=chat_id)
+    if payload is None:
+        raise RuntimeError("Project chat was not persisted.")
+    return payload
+
+
+def list_project_chats(project_id: str) -> List[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.project_id, c.name, c.created_at,
+                   (
+                       SELECT r.run_id
+                       FROM runs r
+                       WHERE r.project_id = c.project_id
+                         AND r.chat_id = c.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_id,
+                   (
+                       SELECT r.status
+                       FROM runs r
+                       WHERE r.project_id = c.project_id
+                         AND r.chat_id = c.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_status,
+                   (
+                       SELECT r.started_at
+                       FROM runs r
+                       WHERE r.project_id = c.project_id
+                         AND r.chat_id = c.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_at
+            FROM project_chats c
+            WHERE c.project_id = ?
+            ORDER BY COALESCE(last_run_at, c.created_at) DESC, c.created_at DESC, c.name COLLATE NOCASE ASC
+            """,
+            (project_id,),
+        ).fetchall()
+        return [_project_chat_row_to_payload(row) for row in rows]
+
+
+def get_project_chat(*, project_id: str, chat_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT c.id, c.project_id, c.name, c.created_at,
+                   (
+                       SELECT r.run_id
+                       FROM runs r
+                       WHERE r.project_id = c.project_id
+                         AND r.chat_id = c.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_id,
+                   (
+                       SELECT r.status
+                       FROM runs r
+                       WHERE r.project_id = c.project_id
+                         AND r.chat_id = c.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_status,
+                   (
+                       SELECT r.started_at
+                       FROM runs r
+                       WHERE r.project_id = c.project_id
+                         AND r.chat_id = c.id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_at
+            FROM project_chats c
+            WHERE c.project_id = ?
+              AND c.id = ?
+            LIMIT 1
+            """,
+            (project_id, chat_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return _project_chat_row_to_payload(row)
+
+
+def create_project_document(
+    *,
+    project_id: str,
+    filename: str,
+    filepath: str,
+    embedding_model: str,
+    status: str = "ingesting",
+    chunk_count: int = 0,
+    error_message: Optional[str] = None,
+) -> dict:
+    doc_id = str(uuid.uuid4())
+    now = _now_utc_iso()
+    with _connect() as conn:
+        if not _project_exists(conn, project_id):
+            raise ValueError("Project not found.")
+        conn.execute(
+            """
+            INSERT INTO project_documents (
+                id, project_id, filename, filepath, embedding_model,
+                created_at, updated_at, status, chunk_count, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                doc_id,
+                project_id,
+                str(filename or "").strip(),
+                str(filepath or "").strip(),
+                str(embedding_model or "").strip(),
+                now,
+                now,
+                str(status or "ingesting"),
+                max(int(chunk_count or 0), 0),
+                str(error_message or "") or None,
+            ),
+        )
+        _touch_project(conn, project_id, updated_at=now)
+        conn.commit()
+    payload = get_project_document(project_id=project_id, doc_id=doc_id)
+    if payload is None:
+        raise RuntimeError("Project document was not persisted.")
+    return payload
+
+
+def update_project_document(
+    *,
+    project_id: str,
+    doc_id: str,
+    status: Optional[str] = None,
+    chunk_count: Optional[int] = None,
+    error_message: Optional[str] = None,
+    filepath: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+) -> Optional[dict]:
+    updates: List[str] = ["updated_at = ?"]
+    params: List[Any] = [_now_utc_iso()]
+    if status is not None:
+        updates.append("status = ?")
+        params.append(str(status))
+    if chunk_count is not None:
+        updates.append("chunk_count = ?")
+        params.append(max(int(chunk_count), 0))
+    if error_message is not None:
+        updates.append("error_message = ?")
+        params.append(str(error_message) or None)
+    if filepath is not None:
+        updates.append("filepath = ?")
+        params.append(str(filepath))
+    if embedding_model is not None:
+        updates.append("embedding_model = ?")
+        params.append(str(embedding_model))
+    params.extend([project_id, doc_id])
+    with _connect() as conn:
+        result = conn.execute(
+            f"""
+            UPDATE project_documents
+            SET {", ".join(updates)}
+            WHERE project_id = ?
+              AND id = ?
+            """,
+            tuple(params),
+        )
+        if int(result.rowcount or 0) > 0:
+            _touch_project(conn, project_id)
+        conn.commit()
+    return get_project_document(project_id=project_id, doc_id=doc_id)
+
+
+def list_project_documents(project_id: str) -> List[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, project_id, filename, filepath, embedding_model,
+                   created_at, updated_at, status, chunk_count, error_message
+            FROM project_documents
+            WHERE project_id = ?
+            ORDER BY updated_at DESC, created_at DESC, filename COLLATE NOCASE ASC
+            """,
+            (project_id,),
+        ).fetchall()
+        return [_project_document_row_to_payload(row) for row in rows]
+
+
+def get_project_document(*, project_id: str, doc_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, project_id, filename, filepath, embedding_model,
+                   created_at, updated_at, status, chunk_count, error_message
+            FROM project_documents
+            WHERE project_id = ?
+              AND id = ?
+            LIMIT 1
+            """,
+            (project_id, doc_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return _project_document_row_to_payload(row)
+
+
+def delete_project_document(project_id: str, doc_id: str) -> Optional[dict]:
+    existing = get_project_document(project_id=project_id, doc_id=doc_id)
+    if existing is None:
+        return None
+    with _connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM project_documents
+            WHERE project_id = ?
+              AND id = ?
+            """,
+            (project_id, doc_id),
+        )
+        _touch_project(conn, project_id)
+        conn.commit()
+    return existing
+
+
+def get_project_ground_truth(project_id: str) -> dict:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT gt.project_id, gt.content, gt.updated_at,
+                   (
+                       SELECT r.run_id
+                       FROM runs r
+                       WHERE r.project_id = gt.project_id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_id,
+                   (
+                       SELECT r.started_at
+                       FROM runs r
+                       WHERE r.project_id = gt.project_id
+                       ORDER BY COALESCE(r.started_at, '') DESC, r.run_id DESC
+                       LIMIT 1
+                   ) AS last_run_at
+            FROM project_ground_truth gt
+            WHERE gt.project_id = ?
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if row is not None:
+            return _project_ground_truth_row_to_payload(row)
+        if not _project_exists(conn, project_id):
+            raise ValueError("Project not found.")
+        now = _now_utc_iso()
+        conn.execute(
+            """
+            INSERT INTO project_ground_truth (project_id, content, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (project_id, "", now),
+        )
+        conn.commit()
+    return get_project_ground_truth(project_id)
+
+
+def upsert_project_ground_truth(*, project_id: str, content: str) -> dict:
+    now = _now_utc_iso()
+    with _connect() as conn:
+        if not _project_exists(conn, project_id):
+            raise ValueError("Project not found.")
+        conn.execute(
+            """
+            INSERT INTO project_ground_truth (project_id, content, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                content = excluded.content,
+                updated_at = excluded.updated_at
+            """,
+            (project_id, str(content or ""), now),
+        )
+        _touch_project(conn, project_id, updated_at=now)
+        conn.commit()
+    return get_project_ground_truth(project_id)
+
+
+def list_project_tools(project_id: str) -> List[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, project_id, tool_name, enabled, version
+            FROM project_tools
+            WHERE project_id = ?
+            ORDER BY tool_name COLLATE NOCASE ASC, id ASC
+            """,
+            (project_id,),
+        ).fetchall()
+        return [_project_tool_row_to_payload(row) for row in rows]
+
+
+def replace_project_tools(project_id: str, bindings: Sequence[Dict[str, Any]]) -> List[dict]:
+    now = _now_utc_iso()
+    with _connect() as conn:
+        if not _project_exists(conn, project_id):
+            raise ValueError("Project not found.")
+        conn.execute("DELETE FROM project_tools WHERE project_id = ?", (project_id,))
+        for item in bindings:
+            if not isinstance(item, dict):
+                continue
+            tool_name = str(item.get("tool_name") or item.get("id") or "").strip()
+            if not tool_name:
+                continue
+            binding_id = str(item.get("id") or uuid.uuid4())
+            conn.execute(
+                """
+                INSERT INTO project_tools (id, project_id, tool_name, enabled, version)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    binding_id,
+                    project_id,
+                    tool_name,
+                    1 if bool(item.get("enabled", True)) else 0,
+                    max(int(item.get("version") or 1), 1),
+                ),
+            )
+        _touch_project(conn, project_id, updated_at=now)
+        conn.commit()
+    return list_project_tools(project_id)
+
+
+def create_project_workflow(
+    *,
+    project_id: str,
+    workflow_spec: Dict[str, Any],
+    is_default: bool = True,
+) -> dict:
+    workflow_row_id = str(uuid.uuid4())
+    created_at = _now_utc_iso()
+    with _connect() as conn:
+        if not _project_exists(conn, project_id):
+            raise ValueError("Project not found.")
+        if is_default:
+            conn.execute(
+                """
+                UPDATE project_workflows
+                SET is_default = 0
+                WHERE project_id = ?
+                """,
+                (project_id,),
+            )
+        conn.execute(
+            """
+            INSERT INTO project_workflows (
+                id, project_id, workflow_spec, is_default, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                workflow_row_id,
+                project_id,
+                _json_dumps(dict(workflow_spec or {})),
+                1 if is_default else 0,
+                created_at,
+            ),
+        )
+        _touch_project(conn, project_id, updated_at=created_at)
+        conn.commit()
+    payload = get_default_project_workflow(project_id)
+    if payload is None:
+        raise RuntimeError("Project workflow was not persisted.")
+    return payload
+
+
+def get_default_project_workflow(project_id: str) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, project_id, workflow_spec, is_default, created_at
+            FROM project_workflows
+            WHERE project_id = ?
+            ORDER BY is_default DESC, created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _project_workflow_row_to_payload(row)
+
+
+def get_project_detail(project_id: str) -> Optional[dict]:
+    project = get_project(project_id)
+    if project is None:
+        return None
+    ground_truth = get_project_ground_truth(project_id)
+    workflow = get_default_project_workflow(project_id)
+    return {
+        **project,
+        "chats": list_project_chats(project_id),
+        "documents": list_project_documents(project_id),
+        "ground_truth": ground_truth,
+        "tools": list_project_tools(project_id),
+        "workflow": workflow,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Row conversion helpers
 # ---------------------------------------------------------------------------
 
-def _tool_row_to_definition(row: sqlite3.Row) -> dict:
+def _project_row_to_payload(row: sqlite3.Row) -> dict:
+    last_run_id = str(row["last_run_id"] or "") if "last_run_id" in row.keys() else ""
+    last_run_at = str(row["last_run_at"] or "") if "last_run_at" in row.keys() else ""
+    return {
+        "id": str(row["id"] or ""),
+        "name": str(row["name"] or ""),
+        "description": str(row["description"] or ""),
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+        "chat_count": int(row["chat_count"] or 0) if "chat_count" in row.keys() else 0,
+        "document_count": int(row["document_count"] or 0) if "document_count" in row.keys() else 0,
+        "last_run_id": last_run_id or None,
+        "last_run_at": last_run_at or None,
+    }
+
+
+def _project_chat_row_to_payload(row: sqlite3.Row) -> dict:
+    last_run_id = str(row["last_run_id"] or "") if "last_run_id" in row.keys() else ""
+    last_run_status = (
+        str(row["last_run_status"] or "") if "last_run_status" in row.keys() else ""
+    )
+    last_run_at = str(row["last_run_at"] or "") if "last_run_at" in row.keys() else ""
+    return {
+        "id": str(row["id"] or ""),
+        "project_id": str(row["project_id"] or ""),
+        "name": str(row["name"] or ""),
+        "created_at": str(row["created_at"] or ""),
+        "last_run_id": last_run_id or None,
+        "last_run_status": last_run_status or None,
+        "last_run_at": last_run_at or None,
+    }
+
+
+def _project_document_row_to_payload(row: sqlite3.Row) -> dict:
+    error_message = str(row["error_message"] or "")
+    return {
+        "id": str(row["id"] or ""),
+        "project_id": str(row["project_id"] or ""),
+        "filename": str(row["filename"] or ""),
+        "filepath": str(row["filepath"] or ""),
+        "embedding_model": str(row["embedding_model"] or ""),
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": str(row["updated_at"] or row["created_at"] or ""),
+        "status": str(row["status"] or ""),
+        "chunk_count": int(row["chunk_count"] or 0),
+        "error_message": error_message or None,
+    }
+
+
+def _project_ground_truth_row_to_payload(row: sqlite3.Row) -> dict:
+    last_run_id = str(row["last_run_id"] or "") if "last_run_id" in row.keys() else ""
+    last_run_at = str(row["last_run_at"] or "") if "last_run_at" in row.keys() else ""
+    return {
+        "project_id": str(row["project_id"] or ""),
+        "content": str(row["content"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+        "used_in_last_run": bool(last_run_id),
+        "last_run_id": last_run_id or None,
+        "last_run_at": last_run_at or None,
+    }
+
+
+def _project_tool_row_to_payload(row: sqlite3.Row) -> dict:
+    return {
+        "id": str(row["id"] or ""),
+        "project_id": str(row["project_id"] or ""),
+        "tool_name": str(row["tool_name"] or ""),
+        "enabled": bool(int(row["enabled"] or 0)),
+        "version": max(int(row["version"] or 1), 1),
+    }
+
+
+def _project_workflow_row_to_payload(row: sqlite3.Row) -> dict:
+    workflow_spec = _json_loads(row["workflow_spec"])
+    return {
+        "id": str(row["id"] or ""),
+        "project_id": str(row["project_id"] or ""),
+        "workflow_spec": workflow_spec if isinstance(workflow_spec, dict) else {},
+        "is_default": bool(int(row["is_default"] or 0)),
+        "created_at": str(row["created_at"] or ""),
+    }
+
+
+def _project_exists(conn: sqlite3.Connection, project_id: str) -> bool:
+    row = conn.execute(
+        "SELECT id FROM projects WHERE id = ? LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _touch_project(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    updated_at: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE projects
+        SET updated_at = ?
+        WHERE id = ?
+        """,
+        (str(updated_at or _now_utc_iso()), project_id),
+    )
+
+
+def _tool_row_to_definition(row: sqlite3.Row, *, conn: Optional[sqlite3.Connection] = None) -> dict:
     input_schema = _json_loads(row["input_schema_json"])
     output_schema = _json_loads(row["output_schema_json"])
+    latest_version: Optional[sqlite3.Row] = None
+    if conn is not None:
+        latest_version = _get_latest_tool_version_row(conn, str(row["id"] or ""))
+    spec_payload = (
+        _json_loads(latest_version["spec_json"])
+        if latest_version is not None
+        else None
+    )
+    spec_map = spec_payload if isinstance(spec_payload, dict) else {}
+    version_num = (
+        int(latest_version["version_num"] or 0)
+        if latest_version is not None
+        else int(row["current_version_num"] or 0)
+    )
+    implementation_kind = str(
+        spec_map.get("implementation_kind")
+        or _tool_implementation_kind_from_row(row)
+    )
+    implementation_ref = str(
+        spec_map.get("implementation_ref")
+        or _tool_implementation_ref_from_row(row)
+    )
     return {
         "id": str(row["id"]),
+        "tool_id": str(row["id"]),
         "name": str(row["name"] or row["id"]),
         "kind": str(row["kind"] or "external"),
         "type": str(row["type"] or "http"),
@@ -1409,6 +2435,12 @@ def _tool_row_to_definition(row: sqlite3.Row) -> dict:
         "config": _json_loads(row["config_json"]) or {},
         "input_schema": input_schema if isinstance(input_schema, (dict, list)) else None,
         "output_schema": output_schema if isinstance(output_schema, (dict, list)) else None,
+        "implementation_kind": implementation_kind,
+        "implementation_ref": implementation_ref,
+        "version": max(version_num, 1),
+        "deleted_at": str(row["deleted_at"] or "") or None,
+        "source": str(spec_map.get("source") or "custom"),
+        "deprecated_reason": spec_map.get("deprecated_reason"),
         "created_at": str(row["created_at"] or ""),
         "updated_at": str(row["updated_at"] or ""),
     }
@@ -1419,12 +2451,16 @@ def _workflow_row_to_definition(row: sqlite3.Row) -> dict:
     spec = _json_loads(row["spec_json"])
     spec_map = spec if isinstance(spec, dict) else {
         "workflow_id": workflow_id,
+        "version": int(row["version_num"] or 1),
         "name": str(row["name"] or workflow_id),
         "description": str(row["description"] or ""),
         "allow_cycles": False,
         "state_schema": [],
         "nodes": [],
         "edges": [],
+        "entry_node": None,
+        "terminal_nodes": [],
+        "tool_refs": [],
     }
 
     compiled = _json_loads(row["compiled_json"])
@@ -1495,6 +2531,186 @@ def _tool_call_row(row: sqlite3.Row) -> dict:
         "error_json": str(row["error_json"] or "null"),
         "status": str(row["status"] or "pending"),
     }
+
+
+def _tool_version_row_to_payload(row: sqlite3.Row) -> dict:
+    spec_payload = _json_loads(row["spec_json"])
+    return {
+        "version_id": str(row["version_id"] or ""),
+        "tool_id": str(row["tool_id"] or ""),
+        "version_num": int(row["version_num"] or 0),
+        "spec": spec_payload if isinstance(spec_payload, dict) else {},
+        "implementation_kind": str(row["implementation_kind"] or ""),
+        "implementation_ref": str(row["implementation_ref"] or ""),
+        "created_at": str(row["created_at"] or ""),
+        "created_by": str(row["created_by"] or ""),
+    }
+
+
+def _get_latest_tool_version_row(
+    conn: sqlite3.Connection,
+    tool_id: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT version_id, tool_id, version_num, spec_json,
+               implementation_kind, implementation_ref,
+               created_at, created_by
+        FROM tool_versions
+        WHERE tool_id = ?
+        ORDER BY version_num DESC
+        LIMIT 1
+        """,
+        (tool_id,),
+    ).fetchone()
+
+
+def _ensure_tool_version_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> None:
+    tool_id = str(row["id"] or "").strip()
+    if not tool_id:
+        return
+    existing = _get_latest_tool_version_row(conn, tool_id)
+    if existing is not None:
+        current_version = int(row["current_version_num"] or 0)
+        if current_version != int(existing["version_num"] or 0):
+            conn.execute(
+                """
+                UPDATE tools
+                SET current_version_num = ?
+                WHERE id = ?
+                """,
+                (int(existing["version_num"] or 0), tool_id),
+            )
+        return
+
+    created_at = str(row["created_at"] or _now_utc_iso())
+    updated_at = str(row["updated_at"] or created_at)
+    spec_payload = _tool_spec_from_definition(
+        _tool_row_to_definition(row),
+        version=1,
+        created_at=created_at,
+        updated_at=updated_at,
+        deleted_at=row["deleted_at"] if "deleted_at" in row.keys() else None,
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO tool_versions (
+            version_id, tool_id, version_num, spec_json,
+            implementation_kind, implementation_ref, created_at, created_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"{tool_id}:v1",
+            tool_id,
+            1,
+            _json_dumps(spec_payload),
+            str(spec_payload.get("implementation_kind") or "python_module"),
+            str(spec_payload.get("implementation_ref") or ""),
+            updated_at,
+            "legacy_backfill",
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE tools
+        SET current_version_num = 1
+        WHERE id = ?
+        """,
+        (tool_id,),
+    )
+
+
+def _tool_spec_from_definition(
+    tool: dict,
+    *,
+    version: int,
+    created_at: str,
+    updated_at: str,
+    deleted_at: Any = None,
+) -> dict:
+    tool_id = str(tool.get("id") or tool.get("tool_id") or "").strip()
+    tool_type = str(tool.get("type") or "http")
+    return {
+        "id": tool_id,
+        "tool_id": tool_id,
+        "name": str(tool.get("name") or tool_id),
+        "description": str(tool.get("description") or ""),
+        "input_schema": (
+            dict(tool.get("input_schema"))
+            if isinstance(tool.get("input_schema"), dict)
+            else {}
+        ),
+        "output_schema": (
+            dict(tool.get("output_schema"))
+            if isinstance(tool.get("output_schema"), dict)
+            else {}
+        ),
+        "implementation_kind": str(
+            tool.get("implementation_kind")
+            or _tool_implementation_kind_from_type(tool_type)
+        ),
+        "implementation_ref": str(
+            tool.get("implementation_ref")
+            or _tool_implementation_ref_from_tool(tool)
+        ),
+        "enabled": bool(tool.get("enabled", True)),
+        "version": max(int(version or 1), 1),
+        "deleted_at": str(deleted_at or tool.get("deleted_at") or "") or None,
+        "source": str(tool.get("source") or "custom"),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "deprecated_reason": (
+            str(tool.get("deprecated_reason") or "") or None
+        ),
+        "kind": str(tool.get("kind") or "external"),
+        "type": tool_type,
+        "config": (
+            dict(tool.get("config"))
+            if isinstance(tool.get("config"), dict)
+            else {}
+        ),
+    }
+
+
+def _tool_implementation_kind_from_type(tool_type: str) -> str:
+    normalized = str(tool_type or "").strip().lower()
+    if normalized == "builtin":
+        return "builtin"
+    if normalized == "http":
+        return "http"
+    if normalized == "prompt":
+        return "prompt"
+    return "python_module"
+
+
+def _tool_implementation_kind_from_row(row: sqlite3.Row) -> str:
+    return _tool_implementation_kind_from_type(str(row["type"] or "http"))
+
+
+def _tool_implementation_ref_from_tool(tool: dict) -> str:
+    tool_id = str(tool.get("id") or tool.get("tool_id") or "").strip()
+    tool_type = str(tool.get("type") or "http").strip().lower()
+    config = tool.get("config") if isinstance(tool.get("config"), dict) else {}
+    if tool_type == "builtin":
+        return f"builtin://{tool_id}"
+    if tool_type == "http":
+        return str(config.get("url") or f"http://tool/{tool_id}")
+    if tool_type == "prompt":
+        return f"prompt://{tool_id}"
+    return f"inline://{tool_id}"
+
+
+def _tool_implementation_ref_from_row(row: sqlite3.Row) -> str:
+    config = _json_loads(row["config_json"])
+    payload = {
+        "id": str(row["id"] or ""),
+        "type": str(row["type"] or "http"),
+        "config": config if isinstance(config, dict) else {},
+    }
+    return _tool_implementation_ref_from_tool(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1611,12 +2827,40 @@ def _legacy_graph_to_workflow_spec(
 
     return {
         "workflow_id": workflow_id,
+        "version": 1,
         "name": name,
         "description": description,
         "allow_cycles": False,
         "state_schema": state_schema,
         "nodes": nodes,
         "edges": edges,
+        "entry_node": next(
+            (
+                str(node.get("id") or "")
+                for node in nodes
+                if str(node.get("id") or "") not in {str(edge.get("to") or "") for edge in edges}
+            ),
+            None,
+        ),
+        "terminal_nodes": sorted(
+            [
+                str(node.get("id") or "")
+                for node in nodes
+                if str(node.get("type") or "") == "finalize"
+            ]
+        ),
+        "tool_refs": sorted(
+            {
+                str(
+                    (node.get("config") or {}).get("tool_name")
+                    or (node.get("config") or {}).get("tool_id")
+                    or ""
+                ).strip()
+                for node in nodes
+                if str(node.get("type") or "") == "tool"
+            }
+            - {""}
+        ),
         "metadata": {
             "legacy_imported": True,
             "enabled": enabled,
@@ -1867,7 +3111,7 @@ def _hash_json(value: object) -> str:
 def _connect() -> sqlite3.Connection:
     if not _DB_PATH:
         raise RuntimeError("Database not initialized. Call init_db() first.")
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 

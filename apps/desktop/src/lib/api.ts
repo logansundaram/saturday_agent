@@ -1,4 +1,13 @@
 import type {
+  ProjectChat as SharedProjectChat,
+  ProjectDetail as SharedProjectDetail,
+  ProjectDocument as SharedProjectDocument,
+  ProjectGroundTruth as SharedProjectGroundTruth,
+  ProjectSummary as SharedProjectSummary,
+  ProjectToolBinding as SharedProjectToolBinding,
+  ProjectWorkflow as SharedProjectWorkflow,
+} from "@saturday/shared/project";
+import type {
   ValidationDiagnostic,
   WorkflowCompileResult,
   WorkflowSpec,
@@ -184,6 +193,50 @@ export type CreateToolPayload = {
   config: ToolConfig;
   input_schema?: any;
   output_schema?: any;
+};
+
+export type ProjectSummary = SharedProjectSummary;
+export type ProjectChat = SharedProjectChat;
+export type ProjectDocument = SharedProjectDocument;
+export type ProjectGroundTruth = SharedProjectGroundTruth;
+export type ProjectToolBinding = SharedProjectToolBinding;
+export type ProjectWorkflow = SharedProjectWorkflow;
+export type ProjectDetail = SharedProjectDetail;
+
+export type CreateProjectPayload = {
+  name: string;
+  description?: string;
+};
+
+export type CreateProjectChatPayload = {
+  name?: string;
+};
+
+export type ProjectRunRequest = {
+  message: string;
+  chat_id: string;
+  workflow_id?: string;
+  model_id: string;
+  tool_ids: string[];
+  messages?: Array<Record<string, any>>;
+  vision_model_id?: string;
+  artifact_ids?: string[];
+  context?: Record<string, any>;
+  stream?: boolean;
+};
+
+export type ProjectRunResponse = {
+  run_id: string;
+  project_id: string;
+  chat_id: string;
+  workflow_id: string;
+  workflow_source: string;
+  project_workflow_id?: string | null;
+  model_id: string;
+  tool_ids: string[];
+  status: string;
+  output_text: string;
+  steps: ChatRunStep[];
 };
 
 export type ChatRunRequest = {
@@ -399,6 +452,18 @@ export type ArtifactUploadResponse = {
 
 type ToolsResponse = {
   tools?: Tool[];
+};
+
+type ProjectsResponse = {
+  projects?: ProjectSummary[];
+};
+
+type ProjectDocumentsResponse = {
+  documents?: ProjectDocument[];
+};
+
+type ProjectToolsResponse = {
+  tools?: ProjectToolBinding[];
 };
 
 type RunLogsResponse = {
@@ -711,6 +776,260 @@ export async function setToolEnabled(id: string, enabled: boolean): Promise<Tool
     method: "PATCH",
     body: JSON.stringify({ enabled }),
   });
+}
+
+export async function getProjects(): Promise<ProjectSummary[]> {
+  try {
+    const payload = await fetchJson<ProjectsResponse | ProjectSummary[]>("/projects");
+    if (Array.isArray(payload)) {
+      return payload;
+    }
+    return Array.isArray(payload.projects) ? payload.projects : [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (message.includes("Request to /projects failed (404)")) {
+      throw new Error(
+        `Projects API unavailable at ${API_BASE_URL}/projects (404). Restart the Saturday API/backend so it loads the new Projects routes.`
+      );
+    }
+    throw error;
+  }
+}
+
+export async function createProject(
+  payload: CreateProjectPayload
+): Promise<ProjectSummary> {
+  return fetchJson<ProjectSummary>("/projects", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getProject(projectId: string): Promise<ProjectDetail> {
+  return fetchJson<ProjectDetail>(`/projects/${encodeURIComponent(projectId)}`);
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/projects/${encodeURIComponent(projectId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    let detail = `Request to /projects/${projectId} failed (${response.status})`;
+    try {
+      const payload = (await response.json()) as { detail?: unknown };
+      if (typeof payload.detail === "string" && payload.detail.trim()) {
+        detail = `${detail}: ${payload.detail}`;
+      }
+    } catch {
+      // Ignore parse failure.
+    }
+    throw new Error(detail);
+  }
+}
+
+export async function createProjectChat(
+  projectId: string,
+  payload: CreateProjectChatPayload = {}
+): Promise<ProjectChat> {
+  return fetchJson<ProjectChat>(`/projects/${encodeURIComponent(projectId)}/chat`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getProjectDocuments(
+  projectId: string
+): Promise<ProjectDocument[]> {
+  const payload = await fetchJson<ProjectDocumentsResponse | ProjectDocument[]>(
+    `/projects/${encodeURIComponent(projectId)}/documents`
+  );
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  return Array.isArray(payload.documents) ? payload.documents : [];
+}
+
+export async function uploadProjectDocument(
+  projectId: string,
+  file: File,
+  embeddingModel?: string
+): Promise<ProjectDocument> {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const controller = new AbortController();
+  const resolvedTimeoutMs = resolveTimeout(REQUEST_TIMEOUT_MS);
+  const timeoutId =
+    resolvedTimeoutMs === null
+      ? null
+      : window.setTimeout(() => controller.abort(), resolvedTimeoutMs);
+
+  const query = embeddingModel
+    ? `?embedding_model=${encodeURIComponent(embeddingModel)}`
+    : "";
+
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/projects/${encodeURIComponent(projectId)}/documents${query}`,
+      {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      }
+    );
+    if (!response.ok) {
+      let detail = `Project document upload failed (${response.status})`;
+      try {
+        const payload = (await response.json()) as { detail?: unknown };
+        if (typeof payload.detail === "string" && payload.detail.trim()) {
+          detail = `${detail}: ${payload.detail}`;
+        } else if (payload.detail !== undefined) {
+          detail = `${detail}: ${JSON.stringify(payload.detail)}`;
+        }
+      } catch {
+        // Keep default message.
+      }
+      throw new Error(detail);
+    }
+    return (await response.json()) as ProjectDocument;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("The request timed out. Please try again.");
+    }
+    if (error instanceof Error) {
+      throw new Error(error.message || "Unable to upload project document.");
+    }
+    throw new Error("Unable to upload project document.");
+  } finally {
+    if (timeoutId !== null) {
+      window.clearTimeout(timeoutId);
+    }
+  }
+}
+
+export async function deleteProjectDocument(
+  projectId: string,
+  docId: string
+): Promise<ProjectDocument> {
+  return fetchJson<ProjectDocument>(
+    `/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(docId)}`,
+    { method: "DELETE" }
+  );
+}
+
+export async function getProjectGroundTruth(
+  projectId: string
+): Promise<ProjectGroundTruth> {
+  return fetchJson<ProjectGroundTruth>(
+    `/projects/${encodeURIComponent(projectId)}/ground-truth`
+  );
+}
+
+export async function updateProjectGroundTruth(
+  projectId: string,
+  content: string
+): Promise<ProjectGroundTruth> {
+  return fetchJson<ProjectGroundTruth>(
+    `/projects/${encodeURIComponent(projectId)}/ground-truth`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    }
+  );
+}
+
+export async function getProjectTools(
+  projectId: string
+): Promise<ProjectToolBinding[]> {
+  const payload = await fetchJson<ProjectToolsResponse | ProjectToolBinding[]>(
+    `/projects/${encodeURIComponent(projectId)}/tools`
+  );
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  return Array.isArray(payload.tools) ? payload.tools : [];
+}
+
+export async function replaceProjectTools(
+  projectId: string,
+  bindings: Array<{
+    id?: string | null;
+    tool_name: string;
+    enabled: boolean;
+    version: number;
+  }>
+): Promise<ProjectToolBinding[]> {
+  const payload = await fetchJson<ProjectToolsResponse>(
+    `/projects/${encodeURIComponent(projectId)}/tools`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ bindings }),
+    }
+  );
+  return Array.isArray(payload.tools) ? payload.tools : [];
+}
+
+export async function getProjectWorkflow(
+  projectId: string
+): Promise<ProjectWorkflow | null> {
+  try {
+    return await fetchJson<ProjectWorkflow>(
+      `/projects/${encodeURIComponent(projectId)}/workflow`
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (message.includes("(404)")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function saveProjectWorkflow(
+  projectId: string,
+  workflowSpec: WorkflowSpec
+): Promise<ProjectWorkflow> {
+  return fetchJson<ProjectWorkflow>(
+    `/projects/${encodeURIComponent(projectId)}/workflow`,
+    {
+      method: "POST",
+      body: JSON.stringify({ workflow_spec: workflowSpec }),
+    }
+  );
+}
+
+export async function runProject(
+  projectId: string,
+  payload: ProjectRunRequest
+): Promise<ProjectRunResponse> {
+  return fetchJson<ProjectRunResponse>(
+    `/projects/${encodeURIComponent(projectId)}/run`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    CHAT_REQUEST_TIMEOUT_MS
+  );
+}
+
+export async function runProjectStream(
+  projectId: string,
+  payload: ProjectRunRequest,
+  onEvent: (event: ChatRunStreamEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  await streamSSE<ChatRunStreamEvent>(
+    `${API_BASE_URL}/projects/${encodeURIComponent(projectId)}/run/stream`,
+    { ...payload, stream: true },
+    onEvent,
+    {
+      signal,
+      timeoutMs: CHAT_REQUEST_TIMEOUT_MS,
+      headers: {
+        Accept: "text/event-stream",
+      },
+    }
+  );
 }
 
 export async function chatRun(req: ChatRunRequest): Promise<ChatRunResponse> {

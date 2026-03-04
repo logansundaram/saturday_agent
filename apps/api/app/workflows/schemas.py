@@ -45,12 +45,16 @@ class EdgeSpecModel(BaseModel):
 
 class WorkflowSpecModel(BaseModel):
     workflow_id: Optional[str] = None
+    version: Optional[int] = None
     name: str
     description: str = ""
     allow_cycles: bool = False
     state_schema: List[StateKeySpecModel] = Field(default_factory=list)
     nodes: List[NodeSpecModel] = Field(default_factory=list)
     edges: List[EdgeSpecModel] = Field(default_factory=list)
+    entry_node: Optional[str] = None
+    terminal_nodes: List[str] = Field(default_factory=list)
+    tool_refs: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -91,6 +95,7 @@ class WorkflowRunRequestV2(BaseModel):
     workflow_version_id: Optional[str] = None
     workflow_id: Optional[str] = None
     draft_spec: Optional[WorkflowSpecModel] = None
+    workflow_spec: Optional[WorkflowSpecModel] = None
     input: Dict[str, Any] = Field(default_factory=dict)
     sandbox_mode: bool = False
     created_by: str = "builder"
@@ -100,11 +105,11 @@ class WorkflowRunRequestV2(BaseModel):
         selectors = [
             bool(str(self.workflow_version_id or "").strip()),
             bool(str(self.workflow_id or "").strip()),
-            self.draft_spec is not None,
+            self.draft_spec is not None or self.workflow_spec is not None,
         ]
         if sum(1 for item in selectors if item) != 1:
             raise ValueError(
-                "Exactly one of workflow_version_id, workflow_id, or draft_spec must be provided."
+                "Exactly one of workflow_version_id, workflow_id, draft_spec, or workflow_spec must be provided."
             )
         return self
 

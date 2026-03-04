@@ -518,7 +518,8 @@ class WorkflowRegistry:
             try:
                 invoke_context = dict(context)
                 invoke_context.setdefault("task", task)
-                tool_output = self._tool_registry.invoke(
+                invoke_context.setdefault("__tool_callsite", "workflow:execute_selected_tools")
+                tool_output = self._tool_registry.invoke_langgraph_tool(
                     tool_id=tool_id,
                     tool_input=tool_input,
                     context=invoke_context,
@@ -855,6 +856,7 @@ class WorkflowRegistry:
             invoke_context["task"] = str(state.get("task") or "")
             if state.get("model"):
                 invoke_context["model_id"] = str(state.get("model"))
+            invoke_context["__tool_callsite"] = f"workflow.node:{node_id}"
 
             started_at = self._utc_now_iso()
             tool_meta = self._tool_registry.get_tool(tool_id) or {}
@@ -872,7 +874,11 @@ class WorkflowRegistry:
                 if not allowed:
                     raise ValueError(f"Tool '{tool_id}' rejected by sandbox policy.")
 
-            output = self._tool_registry.invoke(tool_id=tool_id, tool_input=payload, context=invoke_context)
+            output = self._tool_registry.invoke_langgraph_tool(
+                tool_id=tool_id,
+                tool_input=payload,
+                context=invoke_context,
+            )
             status = "ok" if bool(output.get("ok", False)) else "error"
             ended_at = self._utc_now_iso()
 

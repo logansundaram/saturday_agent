@@ -12,6 +12,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from urllib.parse import urlparse
 
@@ -21,8 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from app import artifacts, db, graph, streaming
+from app import artifacts, db, graph, streaming, usage_trace
+from app.projects import service as project_service
 from app.services import qdrant_client as qdrant_client_service
+from app.tools import service as tool_service
 from app.workflows import service as workflow_service
 from app.workflows.validation import BASE_STATE_KEYS
 
@@ -76,6 +79,150 @@ class ChatRunResponse(BaseModel):
     tool_ids: List[str]
     output_text: str
     steps: List[ChatRunStep]
+
+
+class CreateProjectRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+class ProjectSummaryResponse(BaseModel):
+    id: str
+    name: str
+    description: str
+    created_at: str
+    updated_at: str
+    chat_count: int = 0
+    document_count: int = 0
+    last_run_id: Optional[str] = None
+    last_run_at: Optional[str] = None
+
+
+class ProjectsResponse(BaseModel):
+    projects: List[ProjectSummaryResponse] = Field(default_factory=list)
+
+
+class ProjectChatResponse(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    created_at: str
+    last_run_id: Optional[str] = None
+    last_run_status: Optional[str] = None
+    last_run_at: Optional[str] = None
+
+
+class CreateProjectChatRequest(BaseModel):
+    name: str = "New Chat"
+
+
+class ProjectDocumentResponse(BaseModel):
+    id: str
+    project_id: str
+    filename: str
+    filepath: str
+    embedding_model: str
+    created_at: str
+    updated_at: str
+    status: str
+    chunk_count: int = 0
+    error_message: Optional[str] = None
+
+
+class ProjectDocumentsResponse(BaseModel):
+    documents: List[ProjectDocumentResponse] = Field(default_factory=list)
+
+
+class UpdateProjectGroundTruthRequest(BaseModel):
+    content: str = ""
+
+
+class ProjectGroundTruthResponse(BaseModel):
+    project_id: str
+    content: str
+    updated_at: str
+    used_in_last_run: bool = False
+    last_run_id: Optional[str] = None
+    last_run_at: Optional[str] = None
+
+
+class ProjectToolBindingRequest(BaseModel):
+    id: Optional[str] = None
+    tool_name: str
+    enabled: bool = True
+    version: int = 1
+
+
+class ReplaceProjectToolsRequest(BaseModel):
+    bindings: List[ProjectToolBindingRequest] = Field(default_factory=list)
+
+
+class ProjectToolResponse(BaseModel):
+    id: str
+    tool_name: str
+    name: str
+    description: str
+    enabled: bool
+    version: int
+    kind: str = "external"
+    type: str = "builtin"
+    source: str = "builtin"
+    project_binding_id: Optional[str] = None
+    bound: bool = False
+
+
+class ProjectToolsResponse(BaseModel):
+    tools: List[ProjectToolResponse] = Field(default_factory=list)
+
+
+class ProjectWorkflowRequest(BaseModel):
+    workflow_spec: Dict[str, Any]
+
+
+class ProjectWorkflowResponse(BaseModel):
+    id: Optional[str] = None
+    project_id: Optional[str] = None
+    workflow_spec: Dict[str, Any] = Field(default_factory=dict)
+    compiled: Dict[str, Any] = Field(default_factory=dict)
+    diagnostics: List[Dict[str, Any]] = Field(default_factory=list)
+    valid: bool = False
+    is_default: bool = False
+    created_at: Optional[str] = None
+
+
+class ProjectDetailResponse(ProjectSummaryResponse):
+    chats: List[ProjectChatResponse] = Field(default_factory=list)
+    documents: List[ProjectDocumentResponse] = Field(default_factory=list)
+    ground_truth: ProjectGroundTruthResponse
+    tools: List[ProjectToolResponse] = Field(default_factory=list)
+    workflow: Optional[ProjectWorkflowResponse] = None
+
+
+class ProjectRunRequest(BaseModel):
+    message: str
+    chat_id: str
+    workflow_id: str = ""
+    model_id: str
+    tool_ids: List[str] = Field(default_factory=list)
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    vision_model_id: Optional[str] = None
+    artifact_ids: List[str] = Field(default_factory=list)
+    context: Optional[Dict[str, Any]] = None
+    stream: bool = False
+
+
+class ProjectRunResponse(BaseModel):
+    run_id: str
+    project_id: str
+    chat_id: str
+    workflow_id: str
+    workflow_source: str
+    project_workflow_id: Optional[str] = None
+    model_id: str
+    tool_ids: List[str] = Field(default_factory=list)
+    status: str
+    output_text: str
+    steps: List[ChatRunStep] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):
@@ -138,6 +285,7 @@ class ArtifactUploadResponse(BaseModel):
 
 class ToolSummary(BaseModel):
     id: str
+    tool_id: Optional[str] = None
     name: str
     kind: str = "external"
     type: str = "http"
@@ -147,6 +295,11 @@ class ToolSummary(BaseModel):
     config: Dict[str, Any] = Field(default_factory=dict)
     input_schema: Any = None
     output_schema: Any = None
+    implementation_kind: Optional[str] = None
+    implementation_ref: Optional[str] = None
+    version: int = 1
+    deleted_at: Optional[str] = None
+    deprecated_reason: Optional[str] = None
     created_at: str
     updated_at: str
 
@@ -253,6 +406,7 @@ class WorkflowRunRequest(BaseModel):
     workflow_version_id: Optional[str] = None
     workflow_id: Optional[str] = None
     draft_spec: Optional[Dict[str, Any]] = None
+    workflow_spec: Optional[Dict[str, Any]] = None
     input: Dict[str, Any]
     sandbox_mode: bool = False
     created_by: str = "builder"
@@ -307,6 +461,8 @@ class RunDetailResponse(BaseModel):
     kind: Literal["chat", "workflow"]
     status: str
     workflow_id: str
+    project_id: Optional[str] = None
+    chat_id: Optional[str] = None
     workflow_version_id: Optional[str] = None
     workflow_type: Optional[str] = None
     model_id: Optional[str] = None
@@ -554,6 +710,8 @@ def _extract_run_metadata(payload: Any, result: Any) -> Dict[str, Any]:
     artifacts_obj = artifacts_obj if isinstance(artifacts_obj, dict) else {}
 
     workflow_id = payload_obj.get("workflow_id") or result_obj.get("workflow_id")
+    project_id = payload_obj.get("project_id") or result_obj.get("project_id")
+    chat_id = payload_obj.get("chat_id") or result_obj.get("chat_id")
     workflow_type = result_obj.get("workflow_type") or artifacts_obj.get("workflow_type")
     model_id = (
         payload_obj.get("model_id")
@@ -574,6 +732,8 @@ def _extract_run_metadata(payload: Any, result: Any) -> Dict[str, Any]:
 
     return {
         "workflow_id": str(workflow_id) if workflow_id is not None else None,
+        "project_id": str(project_id) if project_id is not None else None,
+        "chat_id": str(chat_id) if chat_id is not None else None,
         "workflow_type": str(workflow_type) if workflow_type is not None else None,
         "model_id": str(model_id) if model_id is not None else None,
         "tool_ids": tool_ids,
@@ -1394,8 +1554,12 @@ def _normalize_workflow_summary(item: Dict[str, Any]) -> Dict[str, Any]:
 
 def _resolve_db_path() -> Path:
     repo_root = Path(__file__).resolve().parents[3]
-    env_value = os.getenv("SATURDAY_DB_PATH")
+    env_value = str(os.getenv("SATURDAY_DB_PATH") or "").strip()
     if env_value:
+        if env_value == ":memory:":
+            # Preserve the legacy "memory db" intent without creating an
+            # invalid filename on Windows.
+            env_value = "memory.sqlite"
         env_path = Path(env_value)
         if env_path.is_absolute():
             return env_path
@@ -1430,6 +1594,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def trace_route_hits(request: Request, call_next):
+    started = perf_counter()
+    response = await call_next(request)
+    if usage_trace.usage_trace_enabled():
+        usage_trace.emit_usage_trace(
+            "backend.route_hit",
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": round((perf_counter() - started) * 1000, 2),
+            },
+        )
+    return response
 
 
 @app.on_event("startup")
@@ -1583,6 +1764,373 @@ async def chat_stream(request: ChatRunRequest) -> StreamingResponse:
             )
         except Exception as exc:
             message = str(exc) or "Workflow execution failed."
+            emit_event(
+                {
+                    "type": "error",
+                    "run_id": stream_run_id,
+                    "message": message,
+                }
+            )
+            if not final_sent:
+                emit_event(
+                    {
+                        "type": "final",
+                        "run_id": stream_run_id,
+                        "status": "error",
+                        "output_text": message,
+                        "ended_at": _now_utc_iso(),
+                    }
+                )
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    asyncio.create_task(asyncio.to_thread(run_stream))
+
+    async def stream_events():
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield streaming.encode_sse_message(event)
+
+    return StreamingResponse(
+        stream_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/projects", response_model=ProjectSummaryResponse)
+async def create_project(request: CreateProjectRequest) -> ProjectSummaryResponse:
+    try:
+        payload = project_service.create_project_payload(
+            name=request.name,
+            description=request.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ProjectSummaryResponse(**payload)
+
+
+@app.get("/projects", response_model=ProjectsResponse)
+async def list_projects() -> ProjectsResponse:
+    payload = project_service.list_projects_payload()
+    return ProjectsResponse(
+        projects=[ProjectSummaryResponse(**item) for item in payload if isinstance(item, dict)]
+    )
+
+
+@app.get("/projects/{project_id}", response_model=ProjectDetailResponse)
+async def get_project(project_id: str) -> ProjectDetailResponse:
+    try:
+        payload = project_service.get_project_payload(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    workflow_payload = (
+        ProjectWorkflowResponse(**payload["workflow"])
+        if isinstance(payload.get("workflow"), dict)
+        else None
+    )
+    return ProjectDetailResponse(
+        id=str(payload.get("id") or ""),
+        name=str(payload.get("name") or ""),
+        description=str(payload.get("description") or ""),
+        created_at=str(payload.get("created_at") or ""),
+        updated_at=str(payload.get("updated_at") or ""),
+        chat_count=int(payload.get("chat_count") or 0),
+        document_count=int(payload.get("document_count") or 0),
+        last_run_id=str(payload.get("last_run_id") or "") or None,
+        last_run_at=str(payload.get("last_run_at") or "") or None,
+        chats=[
+            ProjectChatResponse(**item)
+            for item in list(payload.get("chats") or [])
+            if isinstance(item, dict)
+        ],
+        documents=[
+            ProjectDocumentResponse(**item)
+            for item in list(payload.get("documents") or [])
+            if isinstance(item, dict)
+        ],
+        ground_truth=ProjectGroundTruthResponse(**dict(payload.get("ground_truth") or {})),
+        tools=[
+            ProjectToolResponse(
+                id=str(item.get("id") or ""),
+                tool_name=str(item.get("tool_name") or item.get("id") or ""),
+                name=str(item.get("name") or item.get("tool_name") or ""),
+                description=str(item.get("description") or ""),
+                enabled=bool(item.get("enabled", False)),
+                version=max(int(item.get("version") or 1), 1),
+                kind=str(item.get("kind") or "external"),
+                type=str(item.get("type") or "builtin"),
+                source=str(item.get("source") or "builtin"),
+                project_binding_id=str(item.get("project_binding_id") or "") or None,
+                bound=bool(item.get("bound", False)),
+            )
+            for item in list(payload.get("tools") or [])
+            if isinstance(item, dict)
+        ],
+        workflow=workflow_payload,
+    )
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+async def delete_project(project_id: str) -> Response:
+    try:
+        project_service.delete_project_payload(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(status_code=204)
+
+
+@app.post("/projects/{project_id}/documents", response_model=ProjectDocumentResponse)
+async def upload_project_document(
+    project_id: str,
+    request: Request,
+    embedding_model: Optional[str] = None,
+) -> ProjectDocumentResponse:
+    try:
+        body = await request.body()
+        filename, _mime, content = _parse_multipart_file(
+            body=body,
+            content_type=str(request.headers.get("content-type") or ""),
+            field_name="file",
+        )
+        payload = project_service.ingest_project_document_payload(
+            project_id=project_id,
+            filename=filename,
+            content=content,
+            embedding_model=embedding_model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return ProjectDocumentResponse(**payload)
+
+
+@app.get("/projects/{project_id}/documents", response_model=ProjectDocumentsResponse)
+async def list_project_documents(project_id: str) -> ProjectDocumentsResponse:
+    try:
+        payload = project_service.list_project_documents_payload(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ProjectDocumentsResponse(
+        documents=[ProjectDocumentResponse(**item) for item in payload if isinstance(item, dict)]
+    )
+
+
+@app.delete(
+    "/projects/{project_id}/documents/{doc_id}",
+    response_model=ProjectDocumentResponse,
+)
+async def delete_project_document(project_id: str, doc_id: str) -> ProjectDocumentResponse:
+    try:
+        payload = project_service.delete_project_document_payload(
+            project_id=project_id,
+            doc_id=doc_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return ProjectDocumentResponse(**payload)
+
+
+@app.put("/projects/{project_id}/ground-truth", response_model=ProjectGroundTruthResponse)
+async def update_project_ground_truth(
+    project_id: str,
+    request: UpdateProjectGroundTruthRequest,
+) -> ProjectGroundTruthResponse:
+    try:
+        payload = project_service.update_project_ground_truth_payload(
+            project_id=project_id,
+            content=request.content,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ProjectGroundTruthResponse(**payload)
+
+
+@app.get("/projects/{project_id}/ground-truth", response_model=ProjectGroundTruthResponse)
+async def get_project_ground_truth(project_id: str) -> ProjectGroundTruthResponse:
+    try:
+        payload = project_service.get_project_ground_truth_payload(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ProjectGroundTruthResponse(**payload)
+
+
+@app.get("/projects/{project_id}/tools", response_model=ProjectToolsResponse)
+async def list_project_tools(project_id: str) -> ProjectToolsResponse:
+    try:
+        payload = project_service.list_project_tools_payload(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ProjectToolsResponse(
+        tools=[
+            ProjectToolResponse(
+                id=str(item.get("id") or ""),
+                tool_name=str(item.get("tool_name") or item.get("id") or ""),
+                name=str(item.get("name") or item.get("tool_name") or ""),
+                description=str(item.get("description") or ""),
+                enabled=bool(item.get("enabled", False)),
+                version=max(int(item.get("version") or 1), 1),
+                kind=str(item.get("kind") or "external"),
+                type=str(item.get("type") or "builtin"),
+                source=str(item.get("source") or "builtin"),
+                project_binding_id=str(item.get("project_binding_id") or "") or None,
+                bound=bool(item.get("bound", False)),
+            )
+            for item in payload
+            if isinstance(item, dict)
+        ]
+    )
+
+
+@app.put("/projects/{project_id}/tools", response_model=ProjectToolsResponse)
+async def replace_project_tools(
+    project_id: str,
+    request: ReplaceProjectToolsRequest,
+) -> ProjectToolsResponse:
+    try:
+        payload = project_service.replace_project_tools_payload(
+            project_id=project_id,
+            bindings=[item.model_dump() for item in request.bindings],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ProjectToolsResponse(
+        tools=[
+            ProjectToolResponse(
+                id=str(item.get("id") or ""),
+                tool_name=str(item.get("tool_name") or item.get("id") or ""),
+                name=str(item.get("name") or item.get("tool_name") or ""),
+                description=str(item.get("description") or ""),
+                enabled=bool(item.get("enabled", False)),
+                version=max(int(item.get("version") or 1), 1),
+                kind=str(item.get("kind") or "external"),
+                type=str(item.get("type") or "builtin"),
+                source=str(item.get("source") or "builtin"),
+                project_binding_id=str(item.get("project_binding_id") or "") or None,
+                bound=bool(item.get("bound", False)),
+            )
+            for item in payload
+            if isinstance(item, dict)
+        ]
+    )
+
+
+@app.post("/projects/{project_id}/workflow", response_model=ProjectWorkflowResponse)
+async def save_project_workflow(
+    project_id: str,
+    request: ProjectWorkflowRequest,
+) -> ProjectWorkflowResponse:
+    try:
+        payload = project_service.save_project_workflow_payload(
+            project_id=project_id,
+            workflow_spec=dict(request.workflow_spec or {}),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not bool(payload.get("valid", False)):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Project workflow failed validation.",
+                "diagnostics": list(payload.get("diagnostics") or []),
+            },
+        )
+    return ProjectWorkflowResponse(**payload)
+
+
+@app.get("/projects/{project_id}/workflow", response_model=ProjectWorkflowResponse)
+async def get_project_workflow(project_id: str) -> ProjectWorkflowResponse:
+    try:
+        payload = project_service.get_project_workflow_payload(project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Project workflow not found.")
+    return ProjectWorkflowResponse(**payload)
+
+
+@app.post("/projects/{project_id}/chat", response_model=ProjectChatResponse)
+async def create_project_chat(
+    project_id: str,
+    request: CreateProjectChatRequest,
+) -> ProjectChatResponse:
+    try:
+        payload = project_service.create_project_chat_payload(
+            project_id=project_id,
+            name=request.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ProjectChatResponse(**payload)
+
+
+@app.post("/projects/{project_id}/run", response_model=ProjectRunResponse)
+async def project_run(project_id: str, request: ProjectRunRequest) -> ProjectRunResponse:
+    try:
+        payload = project_service.run_project_chat_workflow(
+            project_id=project_id,
+            chat_id=request.chat_id,
+            message=request.message,
+            workflow_id=request.workflow_id,
+            model_id=request.model_id,
+            tool_ids=request.tool_ids,
+            messages=request.messages,
+            vision_model_id=request.vision_model_id,
+            artifact_ids=request.artifact_ids,
+            context=request.context,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return ProjectRunResponse(**payload)
+
+
+@app.post("/projects/{project_id}/run/stream")
+async def project_run_stream(project_id: str, request: ProjectRunRequest) -> StreamingResponse:
+    queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    stream_run_id = ""
+    final_sent = False
+
+    def emit_event(payload: Dict[str, Any]) -> None:
+        nonlocal stream_run_id, final_sent
+        event_payload = dict(payload)
+        maybe_run_id = str(event_payload.get("run_id") or "").strip()
+        if maybe_run_id:
+            stream_run_id = maybe_run_id
+        if str(event_payload.get("type") or "") == "final":
+            final_sent = True
+        loop.call_soon_threadsafe(queue.put_nowait, event_payload)
+
+    def run_stream() -> None:
+        try:
+            project_service.run_project_chat_workflow_stream(
+                project_id=project_id,
+                chat_id=request.chat_id,
+                message=request.message,
+                workflow_id=request.workflow_id,
+                model_id=request.model_id,
+                tool_ids=request.tool_ids,
+                messages=request.messages,
+                vision_model_id=request.vision_model_id,
+                artifact_ids=request.artifact_ids,
+                context=request.context,
+                emit_event=emit_event,
+            )
+        except Exception as exc:
+            message = str(exc) or "Project workflow execution failed."
             emit_event(
                 {
                     "type": "error",
@@ -1782,7 +2330,7 @@ async def update_builder_workflow(
 
 @app.get("/tools", response_model=ToolsResponse)
 async def tools() -> ToolsResponse:
-    payload = graph.list_tools()
+    payload = tool_service.list_tools_payload()
     return ToolsResponse(tools=[ToolSummary(**item) for item in payload])
 
 
@@ -1792,7 +2340,7 @@ async def invoke_tool(request: ToolInvokeRequest) -> ToolInvokeResponse:
     if not tool_id:
         raise HTTPException(status_code=400, detail="tool_id is required.")
     try:
-        result = graph.invoke_tool(
+        result = tool_service.invoke_tool_payload(
             tool_id=tool_id,
             tool_input=dict(request.input or {}),
             context=dict(request.context or {}),
@@ -1806,47 +2354,24 @@ async def invoke_tool(request: ToolInvokeRequest) -> ToolInvokeResponse:
 
 @app.post("/builder/tools", response_model=ToolSummary)
 async def create_builder_tool(request: CreateToolRequest) -> ToolSummary:
-    name = request.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Tool name is required.")
-
-    existing_tools = graph.list_tools()
-    existing_ids = {str(item.get("id") or "").strip() for item in existing_tools}
-
-    requested_id = str(request.id or "").strip()
-    if requested_id and not _is_valid_tool_id(requested_id):
-        raise HTTPException(
-            status_code=400,
-            detail="Tool id may only contain letters, numbers, '.', '_' and '-'.",
-        )
-    tool_id = requested_id or _generate_tool_id(name, existing_ids)
-    if tool_id in existing_ids:
-        raise HTTPException(status_code=409, detail=f"Tool id '{tool_id}' already exists.")
-
     try:
-        normalized_config = _normalize_tool_config(request.type, request.config)
+        created = tool_service.create_tool_payload(
+            tool_service.CreateToolRequestModel(
+                name=request.name,
+                id=request.id,
+                kind=request.kind,
+                description=request.description,
+                type=request.type,
+                config=dict(request.config or {}),
+                enabled=bool(request.enabled),
+                input_schema=dict(request.input_schema or {}) if isinstance(request.input_schema, dict) else {},
+                output_schema=dict(request.output_schema or {}) if isinstance(request.output_schema, dict) else {},
+            )
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    now = _now_utc_iso()
-    record: Dict[str, Any] = {
-        "id": tool_id,
-        "name": name,
-        "kind": request.kind,
-        "type": request.type,
-        "description": request.description.strip(),
-        "enabled": bool(request.enabled),
-        "config": normalized_config,
-        "input_schema": request.input_schema,
-        "output_schema": request.output_schema,
-        "created_at": now,
-        "updated_at": now,
-    }
-    db.upsert_tool(record)
-
-    created = db.get_tool(tool_id)
-    if not created:
-        raise HTTPException(status_code=500, detail="Tool was not persisted.")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return ToolSummary(**created)
 
 
@@ -1857,20 +2382,12 @@ async def create_tool_v2(request: CreateToolRequest) -> ToolSummary:
 
 @app.patch("/tools/{tool_id}", response_model=ToolSummary)
 async def update_tool(tool_id: str, request: UpdateToolRequest) -> ToolSummary:
-    existing = db.get_tool(tool_id)
-    if not existing:
-        raise HTTPException(
-            status_code=404,
-            detail="Tool not found or not editable.",
-        )
-
-    updated = db.set_tool_enabled(tool_id, bool(request.enabled))
-    if not updated:
-        raise HTTPException(status_code=500, detail="Failed to update tool.")
-
-    payload = db.get_tool(tool_id)
-    if not payload:
-        raise HTTPException(status_code=500, detail="Tool update did not persist.")
+    try:
+        payload = tool_service.update_tool_enabled_payload(tool_id, bool(request.enabled))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return ToolSummary(**payload)
 
 
@@ -1913,19 +2430,23 @@ async def workflow_compile(
             detail="workflow_spec or task is required for /workflow/compile.",
         )
 
-    result = graph.compile_workflow(
+    result = workflow_service.compile_workflow_request(
         task=task,
         context=request.context,
         workflow_type=request.workflow_type,
     )
     return WorkflowCompileResponse(
-        valid=True,
+        valid=bool(result.get("valid", True)),
         workflow_id=str(result.get("workflow_id") or ""),
         workflow_type=str(result.get("workflow_type") or ""),
-        graph=dict(result.get("graph") or {}),
-        workflow_spec={},
-        compiled={"runtime_graph": dict(result.get("graph") or {})},
-        diagnostics=[],
+        graph=dict((result.get("compiled") or {}).get("runtime_graph") or {}),
+        workflow_spec=dict(result.get("workflow_spec") or {}),
+        compiled=dict(result.get("compiled") or {}),
+        diagnostics=[
+            dict(item)
+            for item in list(result.get("diagnostics") or [])
+            if isinstance(item, dict)
+        ],
     )
 
 
@@ -1936,7 +2457,7 @@ async def workflow_run(request: WorkflowRunRequest) -> WorkflowRunResponse:
         for item in (
             bool(str(request.workflow_version_id or "").strip()),
             bool(str(request.workflow_id or "").strip()),
-            isinstance(request.draft_spec, dict),
+            isinstance(request.draft_spec, dict) or isinstance(request.workflow_spec, dict),
         )
         if item
     )
@@ -1944,7 +2465,7 @@ async def workflow_run(request: WorkflowRunRequest) -> WorkflowRunResponse:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Exactly one of workflow_version_id, workflow_id, or draft_spec must be provided."
+                "Exactly one of workflow_version_id, workflow_id, draft_spec, or workflow_spec must be provided."
             ),
         )
 
@@ -1953,9 +2474,15 @@ async def workflow_run(request: WorkflowRunRequest) -> WorkflowRunResponse:
     resolved_workflow_id = ""
     resolved_version_id = ""
     resolved_version_num = 0
+    selector = workflow_service.normalize_run_selector(
+        workflow_version_id=request.workflow_version_id,
+        workflow_id=request.workflow_id,
+        draft_spec=request.draft_spec,
+        workflow_spec=request.workflow_spec,
+    )
 
-    if str(request.workflow_version_id or "").strip():
-        version = db.get_workflow_version(str(request.workflow_version_id or "").strip())
+    if str(selector.get("workflow_version_id") or "").strip():
+        version = db.get_workflow_version(str(selector.get("workflow_version_id") or "").strip())
         if version is None:
             raise HTTPException(status_code=404, detail="Workflow version not found.")
         workflow_info = version.get("workflow") if isinstance(version.get("workflow"), dict) else {}
@@ -1978,8 +2505,8 @@ async def workflow_run(request: WorkflowRunRequest) -> WorkflowRunResponse:
                 "spec": dict(version.get("spec") or {}),
             }
         )
-    elif str(request.workflow_id or "").strip():
-        latest_version = db.get_latest_workflow_version(str(request.workflow_id or "").strip())
+    elif str(selector.get("workflow_id") or "").strip():
+        latest_version = db.get_latest_workflow_version(str(selector.get("workflow_id") or "").strip())
         if latest_version is None:
             raise HTTPException(status_code=404, detail="Workflow not found.")
         workflow_info = (
@@ -2016,7 +2543,7 @@ async def workflow_run(request: WorkflowRunRequest) -> WorkflowRunResponse:
         )
     else:
         draft_payload = workflow_service.compile_draft_to_runtime_defs(
-            workflow_spec=dict(request.draft_spec or {})
+            workflow_spec=dict(selector.get("draft_spec") or {})
         )
         compile_payload = (
             draft_payload.get("compile")
@@ -2146,7 +2673,9 @@ async def run_detail(run_id: str) -> RunDetailResponse:
         run_id=str(run_row.get("run_id") or ""),
         kind=_normalize_kind(run_row.get("kind")),
         status=str(run_row.get("status") or ""),
-        workflow_id=str(metadata.get("workflow_id") or ""),
+        workflow_id=str(run_row.get("workflow_id") or metadata.get("workflow_id") or ""),
+        project_id=str(run_row.get("project_id") or metadata.get("project_id") or "") or None,
+        chat_id=str(run_row.get("chat_id") or metadata.get("chat_id") or "") or None,
         workflow_version_id=str(run_row.get("workflow_version_id") or "") or None,
         workflow_type=metadata.get("workflow_type"),
         model_id=metadata.get("model_id"),

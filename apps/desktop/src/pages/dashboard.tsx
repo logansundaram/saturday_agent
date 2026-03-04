@@ -8,6 +8,8 @@ import WorkflowPage from "../components/workflow_page";
 import Monitor from "../components/monitor";
 import LeftNav from "../components/left_nav";
 import LocalDocsPage from "./LocalDocsPage";
+import ProjectsPage from "./ProjectsPage";
+import { traceRendererRoute } from "../lib/usageTrace";
 
 type Page =
   | "chat"
@@ -16,6 +18,7 @@ type Page =
   | "builder"
   | "workflows"
   | "local_docs"
+  | "projects"
   | "inspect";
 
 type DashboardNavigateDetail = {
@@ -47,6 +50,10 @@ export default function Dashboard() {
   const [pendingChatRerun, setPendingChatRerun] = useState<PendingChatRerun | null>(
     null
   );
+
+  useEffect(() => {
+    traceRendererRoute(page);
+  }, [page]);
 
   useEffect(() => {
     const handler = (event: Event) => {
@@ -113,6 +120,13 @@ export default function Dashboard() {
         <WorkflowPage />
       ) : page === "local_docs" ? (
         <LocalDocsPage />
+      ) : page === "projects" ? (
+        <ProjectsPage
+          onInspectRun={(runId) => {
+            setSelectedInspectRunId(runId);
+            setPage("inspect");
+          }}
+        />
       ) : page === "inspect" ? (
         <InspectPage runId={selectedInspectRunId} onBack={() => setPage("chat")} />
       ) : null}

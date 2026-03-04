@@ -14,7 +14,7 @@ import require$$5 from "https";
 import require$$6 from "http";
 import require$$0$2 from "net";
 import { spawn as spawn$1 } from "node:child_process";
-import { existsSync, createWriteStream } from "node:fs";
+import { existsSync, createWriteStream, appendFileSync } from "node:fs";
 import net$1 from "node:net";
 const API_BASE_URL$2 = process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 async function invokeTool(toolId, input, options, context) {
@@ -18045,7 +18045,10 @@ async function collectMetrics() {
     safe(() => si.cpu(), { brand: "CPU", cores: 0, physicalCores: 0 }),
     safe(() => si.currentLoad(), { currentLoad: 0 }),
     safe(() => si.mem(), { total: 0, used: 0, active: 0 }),
-    safe(() => si.graphics(), { controllers: [] }),
+    safe(
+      () => si.graphics(),
+      { controllers: [], displays: [] }
+    ),
     safe(() => si.osInfo(), { platform: process.platform, arch: process.arch }),
     safe(() => si.time(), { uptime: 0 }),
     safe(() => fetchBackendHealth(), { api: "down", ollama: "down" })
@@ -18601,6 +18604,47 @@ class QdrantManager {
     }
   }
 }
+const TRACE_PATH = (process.env.SATURDAY_USAGE_TRACE_PATH ?? "").trim();
+function traceEnabled() {
+  return TRACE_PATH.length > 0;
+}
+function traceDesktopEvent(eventType, payload = {}) {
+  if (!traceEnabled()) {
+    return;
+  }
+  const entry = {
+    ts: (/* @__PURE__ */ new Date()).toISOString(),
+    source: "desktop",
+    event_type: eventType.trim() || "unknown",
+    ...payload
+  };
+  mkdir(path$4.dirname(TRACE_PATH), { recursive: true }).then(() => {
+    appendFileSync(TRACE_PATH, `${JSON.stringify(entry)}
+`, "utf-8");
+  }).catch(() => {
+  });
+}
+function registerUsageTraceIpc() {
+  ipcMain.removeAllListeners("usage-trace:event");
+  ipcMain.on("usage-trace:event", (_event, payload) => {
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+    const record = payload;
+    traceDesktopEvent(
+      typeof record.event_type === "string" ? record.event_type : "renderer.event",
+      record
+    );
+  });
+}
+async function writeSmokeReport(payload) {
+  const reportPath = (process.env.SATURDAY_SMOKE_REPORT_PATH ?? "").trim();
+  if (!reportPath) {
+    return;
+  }
+  await mkdir(path$4.dirname(reportPath), { recursive: true });
+  await writeFile(reportPath, JSON.stringify(payload, null, 2), "utf-8");
+}
 const __dirname$1 = path$4.dirname(fileURLToPath(import.meta.url));
 process.env.APP_ROOT = path$4.join(__dirname$1, "..");
 const VITE_DEV_SERVER_URL = process.env["VITE_DEV_SERVER_URL"];
@@ -18608,6 +18652,8 @@ const MAIN_DIST = path$4.join(process.env.APP_ROOT, "dist-electron");
 const RENDERER_DIST = path$4.join(process.env.APP_ROOT, "dist");
 process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL ? path$4.join(process.env.APP_ROOT, "public") : RENDERER_DIST;
 const API_BASE_URL = process.env.SATURDAY_API_URL ?? process.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+const SMOKE_MODE = process.env.SATURDAY_SMOKE === "1";
+const SKIP_QDRANT = process.env.SATURDAY_SKIP_QDRANT === "1" || SMOKE_MODE;
 const qdrantManager = new QdrantManager();
 let teardownQdrantIpcHandlers = null;
 let win = null;
@@ -18679,6 +18725,80 @@ async function configureApiQdrant(status) {
   }
   qdrantManager.setStatusError(lastError);
 }
+async function bodyIncludes(windowRef, expected) {
+  try {
+    const bodyText = await windowRef.webContents.executeJavaScript(
+      "document.body?.innerText ?? ''",
+      true
+    );
+    return String(bodyText ?? "").includes(expected);
+  } catch {
+    return false;
+  }
+}
+async function waitForBodyText(windowRef, expected, timeoutMs = 8e3) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await bodyIncludes(windowRef, expected)) {
+      return true;
+    }
+    await delay(250);
+  }
+  return false;
+}
+async function navigateSmoke(windowRef, page) {
+  traceDesktopEvent("desktop.smoke.navigate", { page });
+  await windowRef.webContents.executeJavaScript(
+    `window.dispatchEvent(new CustomEvent("dashboard:navigate", { detail: ${JSON.stringify({
+      page
+    })} }));`,
+    true
+  );
+  await delay(700);
+}
+async function runSmokeScenario(windowRef) {
+  const assertions = [];
+  const record = (name, passed, detail) => {
+    assertions.push({ name, passed, detail });
+    traceDesktopEvent("desktop.smoke.assertion", { name, passed, detail });
+  };
+  record("main_window_created", true, "Electron main window created.");
+  const chatReady = await waitForBodyText(windowRef, "Chat");
+  record(
+    "chat_page_renders",
+    chatReady,
+    chatReady ? "Chat heading rendered." : "Chat heading did not render."
+  );
+  await navigateSmoke(windowRef, "tools");
+  const toolsReady = await waitForBodyText(windowRef, "Smoke Echo Tool", 12e3) || await waitForBodyText(windowRef, "Web Search", 3e3);
+  record(
+    "tools_list_renders",
+    toolsReady,
+    toolsReady ? "At least one tool card rendered." : "No tool card rendered."
+  );
+  await navigateSmoke(windowRef, "builder");
+  const builderReady = await waitForBodyText(windowRef, "Builder");
+  record(
+    "builder_page_renders",
+    builderReady,
+    builderReady ? "Builder page rendered." : "Builder page did not render."
+  );
+  await navigateSmoke(windowRef, "inspect");
+  const inspectReady = await waitForBodyText(windowRef, "Inspect");
+  record(
+    "inspect_page_renders",
+    inspectReady,
+    inspectReady ? "Inspect page rendered." : "Inspect page did not render."
+  );
+  const ok = assertions.every((item) => item.passed);
+  traceDesktopEvent("desktop.smoke.complete", { ok, assertions });
+  await writeSmokeReport({
+    ok,
+    assertions,
+    completed_at: (/* @__PURE__ */ new Date()).toISOString()
+  });
+  app.exit(ok ? 0 : 1);
+}
 function createWindow() {
   win = new BrowserWindow({
     icon: path$4.join(process.env.VITE_PUBLIC, "electron-vite.svg"),
@@ -18688,8 +18808,15 @@ function createWindow() {
       preload: path$4.join(__dirname$1, "preload.mjs")
     }
   });
+  traceDesktopEvent("desktop.window.created", {
+    smoke_mode: SMOKE_MODE,
+    api_base_url: API_BASE_URL
+  });
   win.webContents.on("did-finish-load", () => {
     win == null ? void 0 : win.webContents.send("main-process-message", (/* @__PURE__ */ new Date()).toLocaleString());
+    if (SMOKE_MODE && win) {
+      void delay(1200).then(() => runSmokeScenario(win));
+    }
   });
   if (VITE_DEV_SERVER_URL) {
     void win.loadURL(VITE_DEV_SERVER_URL);
@@ -18724,15 +18851,22 @@ app.on("before-quit", (event) => {
   });
 });
 app.whenReady().then(async () => {
+  registerUsageTraceIpc();
   registerDocsIpcHandlers({
     getQdrantUrl: () => qdrantManager.getUrl()
   });
-  teardownQdrantIpcHandlers = registerQdrantIpcHandlers(qdrantManager, {
-    onRunning: configureApiQdrant
-  });
-  const status = await qdrantManager.start();
-  if (status.running) {
-    await configureApiQdrant(status);
+  if (!SKIP_QDRANT) {
+    teardownQdrantIpcHandlers = registerQdrantIpcHandlers(qdrantManager, {
+      onRunning: configureApiQdrant
+    });
+    const status = await qdrantManager.start();
+    if (status.running) {
+      await configureApiQdrant(status);
+    }
+  } else {
+    traceDesktopEvent("desktop.qdrant.skipped", {
+      reason: SMOKE_MODE ? "smoke_mode" : "env_flag"
+    });
   }
   createWindow();
 });

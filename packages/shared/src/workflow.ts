@@ -101,12 +101,16 @@ export type EdgeSpec = {
 
 export type WorkflowSpec = {
   workflow_id?: string;
+  version?: number;
   name: string;
   description?: string;
   allow_cycles?: boolean;
   state_schema: StateKeySpec[];
   nodes: NodeSpec[];
   edges: EdgeSpec[];
+  entry_node?: string;
+  terminal_nodes?: string[];
+  tool_refs?: string[];
   metadata?: Record<string, unknown>;
 };
 
@@ -115,15 +119,6 @@ export type WorkflowCompileResult = {
   workflow_spec: WorkflowSpec;
   compiled: Record<string, unknown>;
   diagnostics: ValidationDiagnostic[];
-};
-
-export type ToolRegistryEntry = {
-  id: string;
-  name: string;
-  enabled: boolean;
-  type: string;
-  kind: string;
-  description?: string;
 };
 
 export const NODE_TYPE_OPTIONS: NodeType[] = [

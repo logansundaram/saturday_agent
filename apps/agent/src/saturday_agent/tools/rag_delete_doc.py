@@ -72,8 +72,40 @@ def _resolve_qdrant_url(payload: Dict[str, Any], context_map: Dict[str, Any]) ->
     ).strip()
 
 
+def _is_missing_collection_error(exc: Exception, *, collection: str) -> bool:
+    message = str(exc).lower()
+    collection_name = str(collection or "").strip().lower()
+    if not any(
+        token in message
+        for token in ("not found", "doesn't exist", "does not exist", "404")
+    ):
+        return False
+    if "collection" not in message and collection_name and collection_name not in message:
+        return False
+    return True
+
+
+def _collection_exists(client: QdrantClient, *, collection: str) -> bool:
+    checker = getattr(client, "collection_exists", None)
+    if callable(checker):
+        try:
+            return bool(checker(collection_name=collection))
+        except TypeError:
+            return bool(checker(collection))
+
+    try:
+        client.get_collection(collection_name=collection)
+        return True
+    except Exception as exc:
+        if _is_missing_collection_error(exc, collection=collection):
+            return False
+        raise
+
+
 def _delete_from_qdrant(*, doc_id: str, collection: str, qdrant_url: str) -> None:
     client = QdrantClient(url=qdrant_url)
+    if not _collection_exists(client, collection=collection):
+        return
 
     doc_filter = qdrant_models.Filter(
         must=[

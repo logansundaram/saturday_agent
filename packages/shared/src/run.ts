@@ -7,6 +7,8 @@ export type Run = {
   kind?: string;
   status: string;
   workflow_id?: string;
+  project_id?: string | null;
+  chat_id?: string | null;
   workflow_version_id?: string | null;
   workflow_type?: string | null;
   model_id?: string | null;
@@ -69,6 +71,19 @@ export type RunStepDetail = {
   tool_calls: ToolCall[];
   replayable: boolean;
   replay_disabled_reason?: string | null;
+};
+
+export type StepLogRecord = {
+  run_id: string;
+  step_id: string;
+  node_id: string;
+  node_type: string;
+  tool_name?: string | null;
+  input?: unknown;
+  output?: unknown;
+  error?: unknown;
+  ts_start: string;
+  ts_end: string;
 };
 
 export type ReplayPatchMode = "overlay" | "replace" | "jsonpatch";

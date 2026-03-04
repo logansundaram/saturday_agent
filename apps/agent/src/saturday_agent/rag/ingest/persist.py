@@ -31,6 +31,10 @@ def _repo_root() -> Path:
 def resolve_db_path() -> Path:
     env_value = os.getenv("SATURDAY_DB_PATH", "").strip()
     if env_value:
+        if env_value == ":memory:":
+            # Preserve the legacy "memory db" intent without creating an
+            # invalid filename on Windows.
+            env_value = "memory.sqlite"
         candidate = Path(env_value)
         if candidate.is_absolute():
             return candidate

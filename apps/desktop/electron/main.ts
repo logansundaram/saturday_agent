@@ -10,6 +10,11 @@ import {
   QdrantManager,
   type QdrantStatus,
 } from "./services/QdrantManager";
+import {
+  registerUsageTraceIpc,
+  traceDesktopEvent,
+  writeSmokeReport,
+} from "./usageTrace";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -37,6 +42,8 @@ const API_BASE_URL =
   process.env.SATURDAY_API_URL ??
   process.env.VITE_API_BASE_URL ??
   "http://localhost:8000";
+const SMOKE_MODE = process.env.SATURDAY_SMOKE === "1";
+const SKIP_QDRANT = process.env.SATURDAY_SKIP_QDRANT === "1" || SMOKE_MODE;
 
 const qdrantManager = new QdrantManager();
 let teardownQdrantIpcHandlers: (() => void) | null = null;
@@ -122,6 +129,95 @@ async function configureApiQdrant(status: QdrantStatus): Promise<void> {
   qdrantManager.setStatusError(lastError);
 }
 
+async function bodyIncludes(windowRef: BrowserWindow, expected: string): Promise<boolean> {
+  try {
+    const bodyText = await windowRef.webContents.executeJavaScript(
+      "document.body?.innerText ?? ''",
+      true
+    );
+    return String(bodyText ?? "").includes(expected);
+  } catch {
+    return false;
+  }
+}
+
+async function waitForBodyText(
+  windowRef: BrowserWindow,
+  expected: string,
+  timeoutMs: number = 8_000
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await bodyIncludes(windowRef, expected)) {
+      return true;
+    }
+    await delay(250);
+  }
+  return false;
+}
+
+async function navigateSmoke(windowRef: BrowserWindow, page: string): Promise<void> {
+  traceDesktopEvent("desktop.smoke.navigate", { page });
+  await windowRef.webContents.executeJavaScript(
+    `window.dispatchEvent(new CustomEvent("dashboard:navigate", { detail: ${JSON.stringify({
+      page,
+    })} }));`,
+    true
+  );
+  await delay(700);
+}
+
+async function runSmokeScenario(windowRef: BrowserWindow): Promise<void> {
+  const assertions: Array<{ name: string; passed: boolean; detail: string }> = [];
+  const record = (name: string, passed: boolean, detail: string) => {
+    assertions.push({ name, passed, detail });
+    traceDesktopEvent("desktop.smoke.assertion", { name, passed, detail });
+  };
+
+  record("main_window_created", true, "Electron main window created.");
+  const chatReady = await waitForBodyText(windowRef, "Chat");
+  record(
+    "chat_page_renders",
+    chatReady,
+    chatReady ? "Chat heading rendered." : "Chat heading did not render."
+  );
+
+  await navigateSmoke(windowRef, "tools");
+  const toolsReady =
+    (await waitForBodyText(windowRef, "Smoke Echo Tool", 12_000)) ||
+    (await waitForBodyText(windowRef, "Web Search", 3_000));
+  record(
+    "tools_list_renders",
+    toolsReady,
+    toolsReady ? "At least one tool card rendered." : "No tool card rendered."
+  );
+
+  await navigateSmoke(windowRef, "builder");
+  const builderReady = await waitForBodyText(windowRef, "Builder");
+  record(
+    "builder_page_renders",
+    builderReady,
+    builderReady ? "Builder page rendered." : "Builder page did not render."
+  );
+
+  await navigateSmoke(windowRef, "inspect");
+  const inspectReady = await waitForBodyText(windowRef, "Inspect");
+  record(
+    "inspect_page_renders",
+    inspectReady,
+    inspectReady ? "Inspect page rendered." : "Inspect page did not render."
+  );
+
+  const ok = assertions.every((item) => item.passed);
+  traceDesktopEvent("desktop.smoke.complete", { ok, assertions });
+  await writeSmokeReport({
+    ok,
+    assertions,
+    completed_at: new Date().toISOString(),
+  });
+  app.exit(ok ? 0 : 1);
+}
+
 function createWindow(): void {
   win = new BrowserWindow({
     icon: path.join(process.env.VITE_PUBLIC, "electron-vite.svg"),
@@ -131,10 +227,17 @@ function createWindow(): void {
       preload: path.join(__dirname, "preload.mjs"),
     },
   });
+  traceDesktopEvent("desktop.window.created", {
+    smoke_mode: SMOKE_MODE,
+    api_base_url: API_BASE_URL,
+  });
 
   // Test active push message to Renderer-process.
   win.webContents.on("did-finish-load", () => {
     win?.webContents.send("main-process-message", new Date().toLocaleString());
+    if (SMOKE_MODE && win) {
+      void delay(1200).then(() => runSmokeScenario(win as BrowserWindow));
+    }
   });
 
   if (VITE_DEV_SERVER_URL) {
@@ -182,16 +285,24 @@ app.on("before-quit", (event) => {
 });
 
 app.whenReady().then(async () => {
+  registerUsageTraceIpc();
   registerDocsIpcHandlers({
     getQdrantUrl: () => qdrantManager.getUrl(),
   });
-  teardownQdrantIpcHandlers = registerQdrantIpcHandlers(qdrantManager, {
-    onRunning: configureApiQdrant,
-  });
 
-  const status = await qdrantManager.start();
-  if (status.running) {
-    await configureApiQdrant(status);
+  if (!SKIP_QDRANT) {
+    teardownQdrantIpcHandlers = registerQdrantIpcHandlers(qdrantManager, {
+      onRunning: configureApiQdrant,
+    });
+
+    const status = await qdrantManager.start();
+    if (status.running) {
+      await configureApiQdrant(status);
+    }
+  } else {
+    traceDesktopEvent("desktop.qdrant.skipped", {
+      reason: SMOKE_MODE ? "smoke_mode" : "env_flag",
+    });
   }
 
   createWindow();

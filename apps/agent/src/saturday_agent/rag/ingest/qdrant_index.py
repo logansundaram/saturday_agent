@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Any, Dict, Sequence
 
 from saturday_agent.rag.embeddings import (
@@ -11,8 +12,15 @@ from saturday_agent.rag.embeddings import (
 from saturday_agent.rag.qdrant_store import (
     DEFAULT_QDRANT_COLLECTION,
     DEFAULT_QDRANT_URL,
+    QdrantCollectionMissingError,
+    create_vectorstore_from_texts,
     get_vectorstore,
 )
+
+
+def _qdrant_point_id(*, doc_id: str, chunk_index: int) -> str:
+    seed = f"{str(doc_id).strip()}:{int(chunk_index)}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
 
 def index_chunks_to_qdrant(
@@ -46,12 +54,11 @@ def index_chunks_to_qdrant(
     ollama_base_url = str(os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)).strip()
 
     embeddings = get_ollama_embeddings(resolved_model, ollama_base_url)
-    vectorstore = get_vectorstore(resolved_collection, embeddings, resolved_qdrant_url)
 
     metadatas: list[Dict[str, Any]] = []
     ids: list[str] = []
     for chunk_index, _ in enumerate(texts):
-        ids.append(f"{doc_id}:{chunk_index}")
+        ids.append(_qdrant_point_id(doc_id=doc_id, chunk_index=chunk_index))
         metadatas.append(
             {
                 "doc_id": doc_id,
@@ -63,6 +70,19 @@ def index_chunks_to_qdrant(
                 "source": source_path,
             }
         )
+
+    try:
+        vectorstore = get_vectorstore(resolved_collection, embeddings, resolved_qdrant_url)
+    except QdrantCollectionMissingError:
+        create_vectorstore_from_texts(
+            texts,
+            collection=resolved_collection,
+            embeddings=embeddings,
+            url=resolved_qdrant_url,
+            metadatas=metadatas,
+            ids=ids,
+        )
+        return {"ok": True, "added": len(texts)}
 
     added = vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
     added_count = len(added) if isinstance(added, list) else len(texts)
